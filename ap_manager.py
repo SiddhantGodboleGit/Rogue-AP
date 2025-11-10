@@ -27,7 +27,12 @@ class APManager:
                  dhcp_end: str = "192.168.50.100",
                  channel: int = 6,
                  hw_mode: str = "g",
-                 upstream_iface: Optional[str] = None):
+                 upstream_iface: Optional[str] = None,
+                 # Optional beacon customization: raw IEs to include in beacon (hex string),
+                 # requested beacon interval (ms) and bssid to advertise.
+                 beacon_ies: Optional[str] = None,
+                 beacon_int: Optional[int] = None,
+                 bssid: Optional[str] = None):
         self.iface = iface
         self.ssid = ssid
         self.passphrase = passphrase
@@ -37,6 +42,11 @@ class APManager:
         self.channel = channel
         self.hw_mode = hw_mode
         self.upstream_iface = upstream_iface
+        # Beacon customization stored as strings/values that will be written
+        # into hostapd.conf if provided.
+        self._beacon_ies = beacon_ies
+        self._beacon_int = beacon_int
+        self._bssid = bssid
 
         self._tmpdir: Optional[Path] = None
         self._hostapd_proc: Optional[subprocess.Popen] = None
@@ -126,21 +136,39 @@ class APManager:
         hostapd_conf = self._tmpdir / "hostapd.conf"
         dnsmasq_conf = self._tmpdir / "dnsmasq.conf"
 
-        hostapd_conf.write_text(f"""
-interface={self.iface}
-driver=nl80211
-ssid={self.ssid}
-hw_mode={self.hw_mode}
-channel={self.channel}
-ieee80211n=1
-wmm_enabled=1
-auth_algs=1
-ignore_broadcast_ssid=0
-wpa=2
-wpa_passphrase={self.passphrase}
-wpa_key_mgmt=WPA-PSK
-rsn_pairwise=CCMP
-""".strip())
+        # Build hostapd configuration, optionally adding beacon-related
+        # settings so hostapd will include the original AP's information
+        # elements in its beacons.
+        hostapd_lines = [
+            f"interface={self.iface}",
+            "driver=nl80211",
+            f"ssid={self.ssid}",
+            f"hw_mode={self.hw_mode}",
+            f"channel={self.channel}",
+            "ieee80211n=1",
+            "wmm_enabled=1",
+            "auth_algs=1",
+            "ignore_broadcast_ssid=0",
+            "wpa=2",
+            f"wpa_passphrase={self.passphrase}",
+            "wpa_key_mgmt=WPA-PSK",
+            "rsn_pairwise=CCMP",
+        ]
+
+        # If the caller provided a beacon interval, bssid or raw IEs
+        # (hex string), add appropriate hostapd config keys. hostapd's
+        # `vendor_elements` takes a hex string of IEs to include in
+        # beacons and related frames.
+        if self._beacon_int is not None:
+            hostapd_lines.append(f"beacon_int={int(self._beacon_int)}")
+        if self._bssid:
+            hostapd_lines.append(f"bssid={self._bssid}")
+        if self._beacon_ies:
+            # Ensure it's a hex string without 0x prefix and lower-case
+            ie_hex = self._beacon_ies.lower().lstrip("0x")
+            hostapd_lines.append(f"vendor_elements={ie_hex}")
+
+        hostapd_conf.write_text("\n".join(hostapd_lines))
 
         dnsmasq_conf.write_text(f"""
 interface={self.iface}
@@ -269,8 +297,14 @@ def start_ap(iface: str, ssid: str, password: str,
              dhcp_end: str = "192.168.50.100",
              channel: int = 6,
              upstream_iface: Optional[str] = None,
-             hw_mode: str = "g") -> APManager:
+             hw_mode: str = "g",
+             # Optional beacon customization
+             beacon_ies: Optional[str] = None,
+             beacon_int: Optional[int] = None,
+             bssid: Optional[str] = None) -> APManager:
     """Create an APManager, start it and return the manager object for later stop()."""
-    mgr = APManager(iface, ssid, password, ap_ip, dhcp_start, dhcp_end, channel, hw_mode, upstream_iface)
+    mgr = APManager(iface, ssid, password, ap_ip, dhcp_start, dhcp_end,
+                    channel, hw_mode, upstream_iface,
+                    beacon_ies=beacon_ies, beacon_int=beacon_int, bssid=bssid)
     mgr.start()
     return mgr
