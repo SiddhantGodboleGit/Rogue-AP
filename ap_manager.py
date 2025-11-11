@@ -113,6 +113,26 @@ class APManager:
         except FileNotFoundError:
             print("WARNING: 'iw' not installed or not found in PATH.")
 
+    def _detect_country_code(self) -> str:
+        """Best-effort detection of regulatory country code for hostapd.
+
+        Returns a two-letter code; falls back to 'US' if not detected.
+        """
+        cc = os.environ.get("WIFI_COUNTRY") or os.environ.get("COUNTRY_CODE")
+        if cc and len(cc) == 2:
+            return cc.upper()
+        try:
+            out = subprocess.check_output(["iw", "reg", "get"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                line = line.strip()
+                if line.lower().startswith("country ") and ':' in line:
+                    cand = line.split()[1].split(':')[0].upper()
+                    if len(cand) == 2 and cand.isalpha():
+                        return cand
+        except Exception:
+            pass
+        return "US"
+
     def _nm_manage(self, managed: bool):
         # Try to tell NetworkManager to stop managing this interface. Not fatal if nmcli missing.
         try:
@@ -122,14 +142,48 @@ class APManager:
             pass
 
     def _prepare_interface(self):
-        # Bring interface down, set to AP type, assign static IP, bring up
-        self._run(["ip", "link", "set", self.iface, "down"], check=False)
-        # Let hostapd manage the interface mode (nl80211/driver). Manually
-        # setting the interface to 'ap' can produce noisy kernel messages and
-        # is not required when hostapd is used.
-        self._run(["ip", "addr", "flush", "dev", self.iface], check=False)
-        self._run(["ip", "addr", "add", self.ap_ip, "dev", self.iface], check=True)
-        self._run(["ip", "link", "set", self.iface, "up"], check=True)
+        """Ensure the target interface exists in a usable (managed) state.
+
+        On some chipsets (e.g. Intel iwlwifi) airmon-ng removes/renames the
+        original interface while creating a monitor interface (adding a 'mon'
+        suffix). If the base interface name is missing, attempt recovery by:
+          1. Renaming the monitor interface back to the base name.
+          2. Switching its type from monitor to managed.
+        If recovery fails, raise a clear error so the caller can instruct the
+        user to stop monitor mode first.
+        """
+        base = self.iface
+        mon = base + "mon"
+
+        def iface_exists(name: str) -> bool:
+            try:
+                out = subprocess.check_output(["ip", "-o", "link", "show", name], stderr=subprocess.DEVNULL)
+                return bool(out.strip())
+            except subprocess.CalledProcessError:
+                return False
+            except Exception:
+                return False
+
+        if not iface_exists(base) and iface_exists(mon):
+            print(f"[ap_manager] Base interface '{base}' missing; attempting recovery from '{mon}'")
+            # Try to convert monitor iface back to managed and rename it.
+            self._run(["ip", "link", "set", mon, "down"], check=False)
+            self._run(["iw", mon, "set", "type", "managed"], check=False)
+            self._run(["ip", "link", "set", mon, "name", base], check=False)
+            time.sleep(0.5)
+            if not iface_exists(base):
+                raise RuntimeError(
+                    f"Failed to recover base interface '{base}' from monitor '{mon}'. Stop monitor mode (airmon-ng stop {mon}) and retry.")
+
+        if not iface_exists(base):
+            raise RuntimeError(
+                f"Wireless interface '{base}' not found. Ensure monitor mode is stopped or select the correct interface.")
+
+        # Standard preparation: bring down, flush, assign IP, bring up.
+        self._run(["ip", "link", "set", base, "down"], check=False)
+        self._run(["ip", "addr", "flush", "dev", base], check=False)
+        self._run(["ip", "addr", "add", self.ap_ip, "dev", base], check=True)
+        self._run(["ip", "link", "set", base, "up"], check=True)
 
     def _write_configs(self):
         self._tmpdir = Path(tempfile.mkdtemp(prefix="pyap_"))
@@ -139,21 +193,44 @@ class APManager:
         # Build hostapd configuration, optionally adding beacon-related
         # settings so hostapd will include the original AP's information
         # elements in its beacons.
+        country_code = self._detect_country_code()
+        # Pick an effective hw_mode based on channel for better compatibility
+        eff_hw_mode = self.hw_mode
+        try:
+            ch = int(self.channel)
+            if ch > 14:
+                eff_hw_mode = 'a'  # 5GHz
+            else:
+                eff_hw_mode = 'g'  # 2.4GHz
+        except Exception:
+            pass
+
         hostapd_lines = [
             f"interface={self.iface}",
             "driver=nl80211",
             f"ssid={self.ssid}",
-            f"hw_mode={self.hw_mode}",
+            f"hw_mode={eff_hw_mode}",
             f"channel={self.channel}",
             "ieee80211n=1",
             "wmm_enabled=1",
             "auth_algs=1",
             "ignore_broadcast_ssid=0",
+            # Regulatory settings
+            f"country_code={country_code}",
+            "ieee80211d=1",
+            "ieee80211h=1",
             "wpa=2",
             f"wpa_passphrase={self.passphrase}",
             "wpa_key_mgmt=WPA-PSK",
+            "ieee80211w=0",
+            "wpa_pairwise=CCMP",
             "rsn_pairwise=CCMP",
         ]
+        # Enable 802.11ac for 5GHz where applicable
+        if eff_hw_mode == 'a':
+            hostapd_lines.append("ieee80211ac=1")
+        # Be explicit about not isolating clients
+        hostapd_lines.append("ap_isolate=0")
 
         # If the caller provided a beacon interval, bssid or raw IEs
         # (hex string), add appropriate hostapd config keys. hostapd's
@@ -170,10 +247,15 @@ class APManager:
 
         hostapd_conf.write_text("\n".join(hostapd_lines))
 
+        ap_ip_plain = self.ap_ip.split('/')[0]
         dnsmasq_conf.write_text(f"""
 interface={self.iface}
-dhcp-range={self.dhcp_start},{self.dhcp_end},12h
 bind-interfaces
+port=0
+dhcp-range={self.dhcp_start},{self.dhcp_end},12h
+dhcp-authoritative
+dhcp-option=3,{ap_ip_plain}
+dhcp-option=6,1.1.1.1,8.8.8.8
 """.strip())
 
         # Make the config directory and files world-readable so a non-root
@@ -229,6 +311,29 @@ bind-interfaces
         # Start dnsmasq after hostapd is running
         self._dnsmasq_proc = subprocess.Popen(["dnsmasq", "-C", str(dnsmasq_conf), "--no-daemon"],
                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        if self._dnsmasq_proc.poll() is not None:
+            out = b""
+            err = b""
+            try:
+                if self._dnsmasq_proc.stdout:
+                    out = self._dnsmasq_proc.stdout.read()
+                if self._dnsmasq_proc.stderr:
+                    err = self._dnsmasq_proc.stderr.read()
+            except Exception:
+                pass
+            saved = None
+            try:
+                if self._tmpdir:
+                    saved = self._tmpdir
+                    (self._tmpdir / "dnsmasq.stdout.log").write_bytes(out or b"")
+                    (self._tmpdir / "dnsmasq.stderr.log").write_bytes(err or b"")
+            except Exception:
+                saved = saved or None
+            msg = (err.decode(errors="ignore").strip() or out.decode(errors="ignore").strip())
+            if saved:
+                raise RuntimeError(f"dnsmasq failed to start: {msg}\nLogs written to: {saved}")
+            raise RuntimeError(f"dnsmasq failed to start: {msg}")
 
     def _stop_services(self):
         for p in (self._hostapd_proc, self._dnsmasq_proc):
@@ -303,6 +408,7 @@ def start_ap(iface: str, ssid: str, password: str,
              beacon_int: Optional[int] = None,
              bssid: Optional[str] = None) -> APManager:
     """Create an APManager, start it and return the manager object for later stop()."""
+    print(f"Starting AP on interface '{iface}' with SSID '{ssid}' and password '{password}'")
     mgr = APManager(iface, ssid, password, ap_ip, dhcp_start, dhcp_end,
                     channel, hw_mode, upstream_iface,
                     beacon_ies=beacon_ies, beacon_int=beacon_int, bssid=bssid)
