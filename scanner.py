@@ -51,6 +51,13 @@ def _iface_mac(name: str) -> str:
 
 def start_monitor_mode(interface="wlan0"):
     print(f"Starting monitor mode on {interface}...")
+    # Unblock the interface if it's blocked by rfkill
+    try:
+        print("Unblocking wireless interface with rfkill...")
+        subprocess.run(["sudo", "rfkill", "unblock", "all"], check=False)
+    except Exception as e:
+        print(f"Warning: Could not unblock rfkill: {e}")
+    
     subprocess.run(["sudo", "airmon-ng", "check", "kill"], check=True)
     subprocess.run(["sudo", "airmon-ng", "start", interface], check=True)
     print("Monitor mode started.")
