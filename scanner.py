@@ -5,7 +5,6 @@ from pathlib import Path
 
 from scapy.all import *
 from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11Deauth, Dot11Elt, RadioTap
-
 from ap_manager import start_ap
 
 

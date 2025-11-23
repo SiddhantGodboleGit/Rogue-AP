@@ -8,6 +8,7 @@ IMPORTANT: This repository is provided for educational purposes. Only use these 
 
 - `scanner.py` — script to scan for nearby wireless access points and collect basic information.
 - `ap_manager.py` — helper/manager utilities for working with detected APs.
+- `client_detector.py` — script used to detect Rogue AP from client-side.
 
 ## Requirements
 
@@ -15,12 +16,6 @@ IMPORTANT: This repository is provided for educational purposes. Only use these 
 - A virtual environment (highly recommended)
 - hostapd, dnsmasq, Linux with wireless tools / permissions to access wireless interfaces (monitor mode may be required depending on scanner implementation)
 - Root privileges for raw interface access (some functionality may require sudo)
-
-Python dependencies (minimal):
-
-```bash
-pip install scapy
-```
 
 ## Installation / Setup
 
@@ -47,8 +42,11 @@ pip install scapy
 4. Ensure you run scanning commands with the necessary privileges when required (some scanners need root to open raw sockets or put the wireless card into monitor mode):
 
 ```bash
-# use sudo carefully when required
-sudo .venv/bin/python scanner.py
+# use following command to run the ui for setting up rogue ap
+sudo .venv/bin/python gui.py
+
+# use following command to run the ui for client side rogue ap detection
+sudo .venv/bin/python gui_client_detector.py
 ```
 
 ## Usage

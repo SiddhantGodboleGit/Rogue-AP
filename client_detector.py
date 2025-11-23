@@ -1,23 +1,19 @@
 # client_detector.py
 """
-Client-side Rogue AP detector heuristics.
+Client-side Rogue AP detector heuristics (structured reasons)
 
 Functions:
 - detect_rogue_aps(aps_info, whitelist_ssids, whitelist_bssids, strict_vendor_match=True)
-    -> returns dict: bssid -> {"score": int, "reasons":[...], "info": original_info}
+    -> returns dict: bssid -> {
+         "score": int,
+         "reasons": [str],                # legacy textual reasons
+         "detailed_reasons": [ {key, weight, text}, ... ],  # structured
+         "info": original_info
+       }
 
-Heuristics used (simple, explainable):
-- whitelist: if SSID or BSSID in whitelist -> low suspiciousness
-- duplicate_ssid: same SSID seen with many different BSSIDs (possible evil-twin)
-- vendor_ie_mismatch: when multiple BSSIDs advertise same SSID but vendor_elements differ
-- channel_mismatch: same SSID on many widely different channels
-- missing_vendor_ies: an AP that clones SSID but lacks vendor IEs of legitimate AP
-- short_beacon_interval: unusual beacon interval (optional, if available)
-- rssi_anomaly: if RSSI present and far weaker/stronger than cluster (optional)
-
-Notes:
-- aps_info format expected: { bssid: { 'ssid': str, 'ies_hex': hexstr|None, 'channel': int|None, 'beacon_int': int|None, 'rssi': int|None } }
-- This is client-side heuristic code for demo/prototype only.
+Heuristics used:
+- whitelist, duplicate_ssid, vendor_mismatch, channel_spread,
+  missing_vendor_ies, short_beacon, rssi_anomaly
 """
 
 from collections import defaultdict
@@ -34,6 +30,17 @@ WEIGHTS = {
     'rssi_anomaly': 2,
 }
 
+# Human-friendly text for each heuristic key
+HEURISTIC_TEXT = {
+    'whitelist': "Whitelisted (SSID or BSSID)",
+    'duplicate_ssid': "SSID appears with multiple BSSIDs nearby",
+    'vendor_mismatch': "Vendor IEs differ from majority of APs advertising same SSID",
+    'channel_spread': "SSID present on many channels",
+    'missing_vendor_ies': "This AP missing vendor IEs while others have them",
+    'short_beacon': "Unusually short beacon interval",
+    'rssi_anomaly': "RSSI is an outlier vs peers",
+}
+
 def _normalize_ssid(s):
     if s is None:
         return ''
@@ -47,8 +54,10 @@ def detect_rogue_aps(aps_info,
     Return dict bssid -> detection result:
     {
       'score': int,   # higher -> more suspicious
-      'reasons': [str],
-      'info': original_info
+      'reasons': [str],   # legacy text reasons
+      'detailed_reasons': [ {'key':..., 'weight':..., 'text':...}, ... ],
+      'info': original_info,
+      'severity': 'benign' | 'suspicious' | 'highly suspicious'
     }
     """
     whitelist_ssids = set((s.strip() for s in (whitelist_ssids or []) if s))
@@ -60,7 +69,7 @@ def detect_rogue_aps(aps_info,
         ssid_map[ssid].append((bssid.lower(), info))
 
     results = {}
-    # Precompute some distributions for RSSI-based checks
+    # Precompute some distributions for RSSI-based checks (legacy mean/std method)
     rssi_by_ssid = {}
     for ssid, entries in ssid_map.items():
         rssis = []
@@ -98,39 +107,54 @@ def detect_rogue_aps(aps_info,
             if ies:
                 ies_set.add(ies)
             if ch is not None:
-                channels.add(int(ch))
+                try:
+                    channels.add(int(ch))
+                except Exception:
+                    pass
             if b_int is not None:
-                beacon_ints.add(int(b_int))
+                try:
+                    beacon_ints.add(int(b_int))
+                except Exception:
+                    pass
 
         # If many BSSIDs for same SSID -> possible twin(s)
         group_duplicate_flag = bss_count >= 2  # threshold: 2 or more
         for bssid, info in entries:
-            score = 0
-            reasons = []
+            detailed = []   # list of dicts {key, weight, text}
+            reasons_text = []
+            triggered_keys = []
             b_low = bssid.lower()
             info_dict = info if isinstance(info, dict) else {'ssid': info}
 
             ssid_norm = ssid
             # whitelist checks
             if ssid_norm in whitelist_ssids or b_low in whitelist_bssids:
-                reasons.append("Whitelisted (SSID or BSSID)")
-                score += WEIGHTS['whitelist']
+                k = 'whitelist'
+                w = WEIGHTS.get(k, 0)
+                detailed.append({'key': k, 'weight': w, 'text': HEURISTIC_TEXT.get(k, "")})
+                reasons_text.append(HEURISTIC_TEXT.get(k, "Whitelisted"))
+                triggered_keys.append(k)
 
             # Duplicate SSID heuristic
             if group_duplicate_flag:
-                reasons.append(f"SSID appears with {bss_count} BSSID(s) nearby")
-                score += WEIGHTS['duplicate_ssid']
+                k = 'duplicate_ssid'
+                w = WEIGHTS.get(k, 0)
+                detailed.append({'key': k, 'weight': w, 'text': f"{HEURISTIC_TEXT.get(k)} ({bss_count} BSSID(s))"})
+                reasons_text.append(f"SSID appears with {bss_count} BSSID(s) nearby")
+                triggered_keys.append(k)
 
             # Vendor IE mismatch: group has multiple vendor IE sets -> suspicious
             ies = info_dict.get('ies_hex') if isinstance(info_dict, dict) else None
             if len(ies_set) > 1:
                 # If current AP's IEs differ from the majority (or missing) => suspicious
                 if not ies:
-                    reasons.append("This AP missing vendor IEs while others have them")
-                    score += WEIGHTS['missing_vendor_ies']
+                    k = 'missing_vendor_ies'
+                    w = WEIGHTS.get(k, 0)
+                    detailed.append({'key': k, 'weight': w, 'text': HEURISTIC_TEXT.get(k)})
+                    reasons_text.append("This AP missing vendor IEs while others have them")
+                    triggered_keys.append(k)
                 else:
                     # Check if this ies matches majority
-                    # compute counts
                     freq = {}
                     for x in ies_set:
                         freq[x] = 0
@@ -138,26 +162,33 @@ def detect_rogue_aps(aps_info,
                         val = ii.get('ies_hex') if isinstance(ii, dict) else None
                         if val in freq:
                             freq[val] += 1
-                    # determine majority IE
                     maj_ie = max(freq.items(), key=lambda x: x[1])[0] if freq else None
                     if maj_ie and ies != maj_ie:
-                        reasons.append("Vendor IEs differ from majority of APs advertising same SSID")
-                        score += WEIGHTS['vendor_mismatch']
+                        k = 'vendor_mismatch'
+                        w = WEIGHTS.get(k, 0)
+                        detailed.append({'key': k, 'weight': w, 'text': HEURISTIC_TEXT.get(k)})
+                        reasons_text.append("Vendor IEs differ from majority of APs advertising same SSID")
+                        triggered_keys.append(k)
 
             # Channel spread: if many different channels -> suspicious
             if len(channels) >= 3:
-                reasons.append(f"SSID present on many channels: {sorted(list(channels))}")
-                score += WEIGHTS['channel_spread']
+                k = 'channel_spread'
+                w = WEIGHTS.get(k, 0)
+                detailed.append({'key': k, 'weight': w, 'text': f"{HEURISTIC_TEXT.get(k)}: {sorted(list(channels))}"})
+                reasons_text.append(f"SSID present on many channels: {sorted(list(channels))}")
+                triggered_keys.append(k)
 
             # Beacon interval check (if present)
             b_int = info_dict.get('beacon_int')
             if b_int:
                 try:
                     bi = int(b_int)
-                    # typical values are 100 TU (102.4 ms) on many APs. very small intervals suspicious.
                     if bi < 50:
-                        reasons.append(f"Unusually short beacon interval: {bi}")
-                        score += WEIGHTS['short_beacon']
+                        k = 'short_beacon'
+                        w = WEIGHTS.get(k, 0)
+                        detailed.append({'key': k, 'weight': w, 'text': f"{HEURISTIC_TEXT.get(k)} ({bi})"})
+                        reasons_text.append(f"Unusually short beacon interval: {bi}")
+                        triggered_keys.append(k)
                 except Exception:
                     pass
 
@@ -172,20 +203,33 @@ def detect_rogue_aps(aps_info,
                 std = stats['std'] or 1.0
                 # if r is an outlier >2 std away -> suspicious
                 if abs(r - mean) > 2 * std:
-                    reasons.append(f"RSSI {r} dBm is an outlier vs peers (mean={mean:.1f}, std={std:.1f})")
-                    score += WEIGHTS['rssi_anomaly']
+                    k = 'rssi_anomaly'
+                    w = WEIGHTS.get(k, 0)
+                    detailed.append({'key': k, 'weight': w, 'text': f"{HEURISTIC_TEXT.get(k)} ({r} dBm vs mean {mean:.1f})"})
+                    reasons_text.append(f"RSSI {r} dBm is an outlier vs peers (mean={mean:.1f}, std={std:.1f})")
+                    triggered_keys.append(k)
 
-            # If no reasons found, low score (but keep info)
-            if not reasons:
-                reasons.append("No strong client-side suspicious indicators found")
+            # If no heuristics triggered, add benign message (no weight)
+            if not detailed:
+                reasons_text.append("No strong client-side suspicious indicators found")
+
+            # Score: sum of weights for the triggered keys (this is deterministic and avoids double-counting)
+            score = 0
+            for d in detailed:
+                try:
+                    score += int(d.get('weight', 0))
+                except Exception:
+                    pass
+
+            # legacy result plus structured details
             results[b_low] = {
                 'score': int(score),
-                'reasons': reasons,
+                'reasons': reasons_text,
+                'detailed_reasons': detailed,
                 'info': info_dict
             }
 
     # Post-process: normalize & attach severity label
-    # Compute thresholds (simple)
     if results:
         max_score = max(r['score'] for r in results.values())
     else:

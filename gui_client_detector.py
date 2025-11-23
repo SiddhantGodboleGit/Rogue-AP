@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
-"""
-gui_client_detector_enhanced.py
-
-Enhanced client-side Rogue AP detector GUI based on your original gui_client_detector.py
-Additions:
- - Search / Filter AP list (SSID/BSSID)
- - Save / Load whitelist (JSON)
- - Color-coded suspicious list by severity
- - Indeterminate progress bar when scanning / detecting
- - Right-click menu on AP rows (copy BSSID, set SSID field)
- - Keyboard shortcuts (Ctrl+F focus search, Ctrl+S save whitelist)
- - Double-click behaviors for convenience
- - Small style / layout polish while remaining pure Tkinter/ttk
-
-Drop into same folder as scanner.py, ap_manager.py, client_detector.py and run:
-    sudo python3 gui_client_detector_enhanced.py
-"""
+# gui_client_detector.py (modified)
 from pathlib import Path
 import os
 import sys
@@ -26,6 +10,8 @@ import time
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from scapy.all import sniff, RadioTap, Dot11, Dot11Elt
+import statistics
 
 # local detector
 try:
@@ -96,6 +82,21 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         self._aps_info = {}       # bssid(lower) -> info dict
         self._all_aps = {}        # mirror of _aps_info for filtering/repopulate
         self._suspicious = {}     # bssid(lower) -> result dict
+
+        # Heuristic weights: prefer detector's WEIGHTS if available
+        default_weights = {
+            'whitelist': -5,
+            'duplicate_ssid': 3,
+            'vendor_mismatch': 4,
+            'channel_spread': 2,
+            'missing_vendor_ies': 2,
+            'short_beacon': 1,
+            'rssi_anomaly': 2,
+        }
+        try:
+            self.heuristic_weights = getattr(detector, 'WEIGHTS', default_weights)
+        except Exception:
+            self.heuristic_weights = default_weights
 
         # ---------- UI ----------
         self._create_toolbar()
@@ -192,14 +193,16 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         # Right: Suspicious APs and details
         right = ttk.Frame(main, padding=8)
         ttk.Label(right, text="Suspicious APs", style='Header.TLabel').pack(anchor='w')
-        scol = ("bssid","ssid","severity")
+        scol = ("bssid","ssid","score","severity")
         susp_wrap = ttk.Frame(right, style='Panel.TFrame', padding=6)
         self.susp_tree = ttk.Treeview(susp_wrap, columns=scol, show='headings', height=10)
         self.susp_tree.heading('bssid', text='BSSID')
         self.susp_tree.heading('ssid', text='SSID')
+        self.susp_tree.heading('score', text='Score')
         self.susp_tree.heading('severity', text='Severity')
         self.susp_tree.column('bssid', width=260, anchor='w', stretch=False)
-        self.susp_tree.column('ssid', width=300, anchor='w', stretch=True)
+        self.susp_tree.column('ssid', width=240, anchor='w', stretch=True)
+        self.susp_tree.column('score', width=80, anchor='center', stretch=False)
         self.susp_tree.column('severity', width=120, anchor='center', stretch=False)
         ysb2 = ttk.Scrollbar(susp_wrap, orient='vertical', command=self.susp_tree.yview)
         self.susp_tree.configure(yscrollcommand=ysb2.set)
@@ -224,6 +227,17 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
 
         # Reasons / Details
         ttk.Label(right, text="Reasons / Details").pack(anchor='w', pady=(8,0))
+        
+        # Small weight legend to explain heuristics
+        weights_legend = ttk.Frame(right, style='Panel.TFrame')
+        ttk.Label(weights_legend, text="Heuristic weights (why scores happen):", font=("Garamond", 10, 'bold')).pack(anchor='w')
+        # Build legend text from self.heuristic_weights in a single line for compactness
+        legend_items = []
+        for k, v in self.heuristic_weights.items():
+            legend_items.append(f"{k}={v}")
+        ttk.Label(weights_legend, text=", ".join(legend_items), wraplength=380, style='TLabel').pack(anchor='w', pady=(0,4))
+        weights_legend.pack(fill='x', padx=6, pady=(4,0))
+
         self.reasons_text = tk.Text(right, height=18, wrap='word', state='disabled', background=self._bg_panel)
         self.reasons_text.pack(fill=tk.BOTH, expand=True, pady=(4,0))
 
@@ -354,6 +368,8 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         try:
             self._append_log(f"Scanning for APs on {mon_iface}...")
             seen = set()
+
+            # Helper: stores AP info provided by scanner.scan_aps
             def on_ap(bssid, info):
                 bl = bssid.lower()
                 if bl in seen:
@@ -361,25 +377,117 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
                 seen.add(bl)
                 ssid = info.get('ssid','') if isinstance(info, dict) else str(info)
                 ch = info.get('channel','') if isinstance(info, dict) else ''
-                # store
+                # ensure we keep the dict object for later merging of rssi_samples
                 self._aps_info[bl] = info if isinstance(info, dict) else {'ssid': ssid}
                 self._all_aps[bl] = self._aps_info[bl]
                 self._queue.put(('add_ap', (bssid, ssid, ch)))
+
+            # --- RSSI collector via scapy sniff (runs in parallel) ---
+            # We'll collect a small number of RSSI samples per BSSID and store them
+            rssi_samples_limit = 8
+
+            # thread-safe collector closure
+            def rssi_handler(pkt):
+                try:
+                    if not pkt.haslayer(Dot11):
+                        return
+                    # only process beacon frames (Dot11Beacon) to match scanner
+                    if not pkt.haslayer(Dot11Beacon):
+                        return
+                    bssid = pkt[Dot11].addr3
+                    if not bssid:
+                        return
+                    bl = bssid.lower()
+                    # Extract RSSI defensively from RadioTap
+                    rssi_val = None
+                    try:
+                        if pkt.haslayer(RadioTap):
+                            rt = pkt.getlayer(RadioTap)
+                            rssi_val = getattr(rt, 'dBm_AntSignal', None)
+                        if rssi_val is None:
+                            # fallback attempt
+                            rssi_val = getattr(pkt, 'dBm_AntSignal', None)
+                        if rssi_val is not None:
+                            rssi_val = int(rssi_val)
+                    except Exception:
+                        rssi_val = None
+
+                    if rssi_val is None:
+                        return
+
+                    # store into shared _aps_info structure (create if missing)
+                    info = self._aps_info.get(bl)
+                    if info is None:
+                        # keep minimal fields so detector still sees SSID if later present
+                        info = {'ssid': '', 'ies_hex': None, 'channel': None, 'beacon_int': None}
+                        self._aps_info[bl] = info
+                        self._all_aps[bl] = info
+
+                    # use a small list 'rssi_samples' to accumulate values
+                    lst = info.get('rssi_samples')
+                    if not isinstance(lst, list):
+                        lst = []
+                        info['rssi_samples'] = lst
+                    # append if under limit
+                    if len(lst) < rssi_samples_limit:
+                        lst.append(rssi_val)
+                except Exception:
+                    # never allow sniffer to crash the GUI thread
+                    return
+
+            # start background sniffing for the same timeout
+            sniff_thread = threading.Thread(target=lambda: sniff(iface=mon_iface, prn=rssi_handler, timeout=timeout, store=0), daemon=True)
+            sniff_thread.start()
+            # --- end RSSI collector ---
+
             # start progress UI
             self.status_var.set("Scanning...")
             self.progress.start(10)
+            # Run the existing scanner which will call on_ap() for each AP found
             aps = scanner.scan_aps(mon_iface, timeout=timeout, on_ap=on_ap)
-            # scanner returns dict of aps; ensure all included
+
+            # Ensure any APs returned synchronously by scanner are merged into UI if not seen
             for b, info in (aps or {}).items():
                 bl = b.lower()
                 if bl not in seen:
                     on_ap(b, info)
-            self._append_log(f"Scan complete: {len(self._aps_info)} AP(s) observed")
+
+            # Wait briefly for sniff thread to finish (it should end when timeout elapses)
+            try:
+                sniff_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+            # --- Post-process: compute median RSSI and attach single 'rssi' value for detector ---
+            for bl, info in list(self._aps_info.items()):
+                try:
+                    if isinstance(info, dict):
+                        samples = info.get('rssi_samples') or []
+                        # if samples present, compute median robustly
+                        if samples:
+                            try:
+                                med = statistics.median(samples)
+                                # store median as integer rssi value (detector expects int)
+                                info['rssi'] = int(med)
+                            except Exception:
+                                # fallback: take first sample
+                                info['rssi'] = int(samples[0])
+                        else:
+                            # leave info['rssi'] as None if no samples collected
+                            if 'rssi' not in info:
+                                info['rssi'] = None
+                    # update the mirrored all_aps too
+                    self._all_aps[bl] = self._aps_info[bl]
+                except Exception:
+                    continue
+
+            self._append_log(f"Scan complete: {len(self._aps_info)} AP(s) observed (RSSI samples collected)")
         except Exception as e:
             self._append_log(f"Scan failed: {e}")
         finally:
             self.status_var.set("Idle")
             self.progress.stop()
+
 
     # ---------------------- Process queue ----------------------
     def _process_queue(self):
@@ -405,8 +513,10 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
                         info = val['info']
                         ss = info.get('ssid') if isinstance(info, dict) else ''
                         sev = val.get('severity','suspicious')
+                        score = val.get('score', 0)
                         tag = sev
-                        self.susp_tree.insert('', tk.END, values=(b, ss, sev), tags=(tag,))
+                        # Insert values in order: bssid, ssid, score, severity
+                        self.susp_tree.insert('', tk.END, values=(b, ss, score, sev), tags=(tag,))
                     # update AP tree tagging for severity if present
                     self._apply_severity_tags()
                 elif kind == 'log':
@@ -436,7 +546,7 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
             # log top suspicious
             sorted_res = sorted(res.items(), key=lambda x: x[1]['score'], reverse=True)
             for b, val in sorted_res[:6]:
-                self._queue.put(('log', f"{b} -> {val['severity']}: {'; '.join(val['reasons'])}"))
+                self._queue.put(('log', f"{b} -> {val['severity']}: {'; '.join(val.get('reasons', []))}"))
             self._append_log("Detection complete.")
         except Exception as e:
             self._append_log(f"Detection failed: {e}")
@@ -488,17 +598,91 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
             if not sel:
                 return
             iid = sel[0]
-            bssid, ssid, sev = self.susp_tree.item(iid,'values')
+            # values order: bssid, ssid, score, severity
+            vals = self.susp_tree.item(iid,'values')
+            if not vals:
+                return
+            bssid = vals[0]
+            ssid = vals[1] if len(vals) > 1 else ''
+            sev = vals[3] if len(vals) > 3 else vals[-1]
             rec = self._suspicious.get(bssid.lower())
-            title = f"Suspicious AP {bssid} ({ssid})\nSeverity: {sev}\n\nReasons:\n"
-            self._show_info_in_details(title, rec.get('info',{}) if rec else {})
-            # expand reasons too
-            if rec:
-                self.reasons_text.configure(state='normal')
-                self.reasons_text.insert('end', "\nDetailed reasons:\n")
-                for r in rec.get('reasons', []):
-                    self.reasons_text.insert('end', f"- {r}\n")
-                self.reasons_text.configure(state='disabled')
+            if not rec:
+                return
+
+            # Header + summary
+            header = f"Suspicious AP {bssid} ({ssid})\nSeverity: {rec.get('severity','N/A')}\nScore: {rec.get('score','N/A')}\n\n"
+
+            # If detector returned structured reasons, use them
+            detailed = rec.get('detailed_reasons')
+            explanation_lines = []
+            total_calc = 0
+            if isinstance(detailed, list) and detailed:
+                for d in detailed:
+                    key = d.get('key')
+                    w = d.get('weight', 0)
+                    text = d.get('text') or d.get('key') or ''
+                    explanation_lines.append(f"{text}  →  ({key}, weight={w})")
+                    try:
+                        total_calc += int(w)
+                    except Exception:
+                        pass
+            else:
+                # Fallback: map legacy textual reasons to weights where possible
+                for r in (rec.get('reasons') or []):
+                    mapped = None
+                    rl = r.lower()
+                    if 'whitelist' in rl:
+                        mapped = 'whitelist'
+                    elif 'ssid appears' in rl or 'bssid(s)' in rl or 'appears with' in rl:
+                        mapped = 'duplicate_ssid'
+                    elif 'vendor ie' in rl and 'differ' in rl:
+                        mapped = 'vendor_mismatch'
+                    elif 'missing vendor' in rl or 'missing vendor ies' in rl:
+                        mapped = 'missing_vendor_ies'
+                    elif 'channel' in rl and ('many' in rl or 'channels' in rl):
+                        mapped = 'channel_spread'
+                    elif 'unusually short' in rl or 'beacon interval' in rl:
+                        mapped = 'short_beacon'
+                    elif 'rssi' in rl:
+                        mapped = 'rssi_anomaly'
+
+                    if mapped:
+                        w = self.heuristic_weights.get(mapped, 0)
+                        explanation_lines.append(f"{r}  →  ({mapped}, weight={w})")
+                        try:
+                            total_calc += int(w)
+                        except Exception:
+                            pass
+                    else:
+                        explanation_lines.append(f"{r}  →  (weight=N/A)")
+
+            # Build detail text: include raw info as well
+            info = rec.get('info', {}) if rec else {}
+            info_lines = []
+            if isinstance(info, dict):
+                # show some useful fields first
+                for k in ('ssid','channel','ies_hex','beacon_int','rssi','rssi_samples'):
+                    if k in info:
+                        info_lines.append(f"{k}: {info.get(k)}")
+                # any other fields
+                for k,v in info.items():
+                    if k not in ('ssid','channel','ies_hex','beacon_int','rssi','rssi_samples'):
+                        info_lines.append(f"{k}: {v}")
+
+            # Present everything in the reasons_text widget
+            self.reasons_text.configure(state='normal')
+            self.reasons_text.delete(1.0,'end')
+            self.reasons_text.insert('end', header)
+            self.reasons_text.insert('end', "Why this AP was flagged (heuristic -> weight):\n")
+            for line in explanation_lines:
+                self.reasons_text.insert('end', f"- {line}\n")
+            self.reasons_text.insert('end', f"\nCalculated weight sum (from mapped heuristics): {total_calc}\n")
+            # show detector's computed score to compare
+            self.reasons_text.insert('end', f"Detector reported score: {rec.get('score')}\n\n")
+            self.reasons_text.insert('end', "Raw AP info:\n")
+            for line in info_lines:
+                self.reasons_text.insert('end', f"- {line}\n")
+            self.reasons_text.configure(state='disabled')
         except Exception:
             pass
 
