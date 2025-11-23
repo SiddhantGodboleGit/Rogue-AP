@@ -352,8 +352,9 @@ class GuiServerDetectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Rogue AP — Server Detector GUI")
-        self.geometry("1400x900")
-        self.minsize(1200, 800)
+        # match main GUI start size and minimums for consistent UX
+        self.geometry("900x600")
+        self.minsize(1800, 1000)
 
         # Styling
         self.style = ttk.Style(self)
@@ -364,6 +365,7 @@ class GuiServerDetectorApp(tk.Tk):
         default_font = ("Garamond", 11)
         self.option_add("*Font", default_font)
 
+        # Use same palette and ttk style settings as main GUI for consistent aesthetics
         self._bg_primary = "#f6f1e1"
         self._bg_panel = "#fefaf0"
         self._accent = "#b8893f"
@@ -372,17 +374,24 @@ class GuiServerDetectorApp(tk.Tk):
         self._muted = "#6c5434"
         self.configure(bg=self._bg_primary)
 
-        self.style.configure('TFrame', background=self._bg_primary)
-        self.style.configure('TLabel', background=self._bg_primary, foreground=self._text_main)
-        self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 12, 'bold'))
-        self.style.configure('Panel.TFrame', background=self._bg_panel)
-        self.style.configure('Status.TLabel', background=self._bg_primary, foreground=self._muted, font=("Garamond", 10, 'italic'))
-        self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main, rowheight=26)
-        self.style.configure('Treeview.Heading', background='#f0e3c7', foreground=self._accent, font=("Garamond", 11, 'bold'))
-        self.style.configure('Horizontal.TProgressbar', background=self._accent, troughcolor='#efe5cc')
-
-        # Color tags
-        self.style.map('Treeview', background=[('selected', '#ecd9b0')], foreground=[('selected', self._text_main)])
+        try:
+            self.style.configure('TFrame', background=self._bg_primary)
+            self.style.configure('TLabel', background=self._bg_primary, foreground=self._text_main)
+            self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 12, 'bold'))
+            self.style.configure('Toolbar.TFrame', background=self._bg_primary)
+            self.style.configure('Panel.TFrame', background=self._bg_panel)
+            self.style.configure('Status.TLabel', background=self._bg_primary, foreground=self._muted, font=("Garamond", 10, 'italic'))
+            self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main)
+            self.style.map('Treeview', background=[('selected', '#ecd9b0')], foreground=[('selected', self._text_main)])
+            self.style.configure('Treeview.Heading', background='#f0e3c7', foreground=self._accent, font=("Garamond", 11, 'bold'))
+            self.style.configure('TButton', padding=6, background=self._accent, foreground="white", borderwidth=0)
+            self.style.map('TButton', background=[('active', self._accent_dark), ('disabled', '#d4c3a3')], foreground=[('disabled', '#a99a84')])
+            self.style.configure('TEntry', fieldbackground=self._bg_panel, foreground=self._text_main)
+            self.style.map('TEntry', fieldbackground=[('disabled', '#ede1c7'), ('readonly', '#f2e7d0')])
+            self.style.configure('Horizontal.TProgressbar', background=self._accent, troughcolor='#efe5cc', bordercolor='#d4c3a3')
+            self.style.configure('TPanedwindow', background=self._bg_primary)
+        except Exception:
+            pass
 
         # State
         self._queue = queue.Queue()
