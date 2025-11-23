@@ -37,6 +37,11 @@ try:
 except Exception:
     start_ap = None
 
+try:
+    from mitm_attack import MITMAttack
+except Exception:
+    MITMAttack = None
+
 APP_DIR = Path(__file__).resolve().parent
 SCANNER_PATH = APP_DIR / "scanner.py"
 
@@ -56,32 +61,8 @@ class GuiApp(tk.Tk):
         default_font = ("Garamond", 11)
         self.option_add("*Font", default_font)
 
-        # Light parchment-inspired palette for a softer medieval feel
-        self._bg_primary = "#f6f1e1"
-        self._bg_panel = "#fefaf0"
-        self._accent = "#b8893f"
-        self._accent_dark = "#9a6c2a"
-        self._text_main = "#3f2a14"
-        self._muted = "#6c5434"
-
-        self.configure(bg=self._bg_primary)
-        self.style.configure('TFrame', background=self._bg_primary)
-        self.style.configure('TLabel', background=self._bg_primary, foreground=self._text_main)
-        self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 12, 'bold'))
-        self.style.configure('TButton', padding=6, background=self._accent, foreground="white", borderwidth=0)
-        self.style.map('TButton', background=[('active', self._accent_dark), ('disabled', '#d4c3a3')], foreground=[('disabled', '#a99a84')])
-        self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main, bordercolor='#d4c3a3')
-        self.style.configure('Treeview.Heading', background='#f0e3c7', foreground=self._accent, font=("Garamond", 11, 'bold'))
-        self.style.map('Treeview', background=[('selected', '#ecd9b0')], foreground=[('selected', self._text_main)])
-        self.style.configure('Toolbar.TFrame', background=self._bg_primary)
-        self.style.configure('Panel.TFrame', background=self._bg_panel)
-        self.style.configure('Status.TLabel', background=self._bg_primary, foreground=self._muted, font=("Garamond", 10, 'italic'))
-        self.style.configure('TEntry', fieldbackground=self._bg_panel, foreground=self._text_main)
-        self.style.map('TEntry', fieldbackground=[('disabled', '#ede1c7'), ('readonly', '#f2e7d0')])
-        self.style.configure('TSpinbox', fieldbackground=self._bg_panel, foreground=self._text_main)
-        self.style.map('TSpinbox', fieldbackground=[('disabled', '#ede1c7')])
-        self.style.configure('TCheckbutton', background=self._bg_primary, foreground=self._text_main)
-        self.style.configure('Horizontal.TProgressbar', background=self._accent, troughcolor='#efe5cc', bordercolor='#d4c3a3')
+        self._hacker_mode = tk.BooleanVar(value=False)
+        self._set_palette(hacker=False)
 
         # Work queue for GUI-safe updates
         self._queue = queue.Queue()
@@ -89,14 +70,88 @@ class GuiApp(tk.Tk):
         self._reader_thread = None
         # Cache of AP details from scanner (bssid -> info dict)
         self._aps_info = {}
+        # Deauth attack state
+        self.deauth_thread = None
+        self.deauth_stop_event = None
+        # MITM attack state
+        self.mitm_attack = None
 
         self._create_menu()
         self._create_toolbar()
         self._create_main_panes()
+        self._set_palette(self._hacker_mode.get())
         self._layout()
 
         # Poll queue
         self.after(100, self._process_queue)
+
+    def _set_palette(self, hacker: bool):
+        if hacker:
+            self._bg_primary = "#263147"
+            self._bg_panel = "#2A3E49"
+            self._accent = "#148D7D"
+            self._accent_dark = "#01b44c"
+            self._text_main = "#f2f4f8"
+            self._muted = "#8d90a3"
+            heading_bg = "#1c1f29"
+            panel_border = "#262c38"
+            tree_selection = "#2f394d"
+            progress_trough = "#161924"
+            entry_disabled = "#1c2130"
+            entry_readonly = "#181d29"
+            btn_disabled_bg = "#1f2432"
+            btn_disabled_fg = "#4d5163"
+        else:
+            self._bg_primary = "#f6f1e1"
+            self._bg_panel = "#fefaf0"
+            self._accent = "#b8893f"
+            self._accent_dark = "#9a6c2a"
+            self._text_main = "#3f2a14"
+            self._muted = "#6c5434"
+            heading_bg = "#f0e3c7"
+            panel_border = "#dec79a"
+            tree_selection = "#ecd9b0"
+            progress_trough = "#efe5cc"
+            entry_disabled = "#ede1c7"
+            entry_readonly = "#f2e7d0"
+            btn_disabled_bg = "#d4c3a3"
+            btn_disabled_fg = "#a99a84"
+
+        self.configure(bg=self._bg_primary)
+        self.style.configure('TFrame', background=self._bg_primary)
+        self.style.configure('TLabel', background=self._bg_primary, foreground=self._text_main)
+        self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 12, 'bold'))
+        self.style.configure('TButton', padding=6, background=self._accent, foreground="white", borderwidth=0)
+        self.style.map('TButton', background=[('active', self._accent_dark), ('disabled', btn_disabled_bg)], foreground=[('disabled', btn_disabled_fg)])
+        self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main, bordercolor=panel_border)
+        self.style.configure('Treeview.Heading', background=heading_bg, foreground=self._accent, font=("Garamond", 11, 'bold'))
+        self.style.map('Treeview', background=[('selected', tree_selection)], foreground=[('selected', self._text_main)])
+        self.style.configure('Toolbar.TFrame', background=self._bg_primary)
+        self.style.configure('Panel.TFrame', background=self._bg_panel)
+        self.style.configure('Status.TLabel', background=self._bg_primary, foreground=self._muted, font=("Garamond", 10, 'italic'))
+        self.style.configure('TEntry', fieldbackground=self._bg_panel, foreground=self._text_main)
+        self.style.map('TEntry', fieldbackground=[('disabled', entry_disabled), ('readonly', entry_readonly)])
+        self.style.configure('TSpinbox', fieldbackground=self._bg_panel, foreground=self._text_main)
+        self.style.map('TSpinbox', fieldbackground=[('disabled', entry_disabled)])
+        self.style.configure('TCheckbutton', background=self._bg_primary, foreground=self._text_main)
+        self.style.map('TCheckbutton', foreground=[('disabled', self._muted)])
+        self.style.configure('Horizontal.TProgressbar', background=self._accent, troughcolor=progress_trough, bordercolor=panel_border)
+        self.style.configure('TPanedwindow', background=self._bg_primary)
+
+        if hasattr(self, 'log_text'):
+            self.log_text.configure(
+                bg=self._bg_panel,
+                fg=self._text_main,
+                insertbackground=self._accent,
+                highlightbackground=panel_border,
+                highlightcolor=panel_border
+            )
+
+    def _on_toggle_theme(self):
+        hacker_enabled = self._hacker_mode.get()
+        self._set_palette(hacker_enabled)
+        mode_label = "Hacker" if hacker_enabled else "Classic"
+        self._append_log(f"{mode_label} theme {'enabled' if hacker_enabled else 'restored'}.")
 
     def _create_menu(self):
         menubar = tk.Menu(self)
@@ -120,8 +175,10 @@ class GuiApp(tk.Tk):
         self.iface_entry.pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Discover", command=self.discover_interfaces).pack(side=tk.LEFT, padx=(6, 4))
         ttk.Button(toolbar, text="Start Monitor", command=self.on_start_monitor).pack(side=tk.LEFT, padx=(4, 4))
+
         ttk.Button(toolbar, text="Stop Monitor", command=self.on_stop_monitor).pack(side=tk.LEFT, padx=(4, 4))
         ttk.Button(toolbar, text="Scan APs", command=self.on_scan_aps).pack(side=tk.LEFT, padx=(4, 4))
+        ttk.Checkbutton(toolbar, text="Dark Theme", variable=self._hacker_mode, command=self._on_toggle_theme).pack(side=tk.LEFT, padx=(12, 6))
 
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(toolbar, textvariable=self.status_var, style='Status.TLabel').pack(side=tk.RIGHT)
@@ -165,30 +222,45 @@ class GuiApp(tk.Tk):
         ttk.Button(controls, text="Export CSV", command=self.export_csv).pack(side=tk.LEFT, padx=(6,6))
         controls.pack(anchor=tk.W, pady=(6,0))
 
-        # Action controls
+        # Input fields for Rogue AP & attack parameters (no action buttons here)
         action_frame = ttk.Frame(left, style='Panel.TFrame')
-        ttk.Label(action_frame, text="Upstream iface:").pack(side=tk.LEFT, padx=(6,2))
         self.upstream_var = tk.StringVar()
+        self.timeout_var = tk.IntVar(value=15)
+        self.clone_vendor_var = tk.BooleanVar(value=False)
+        self.ssid_var = tk.StringVar()
+        self.pass_var = tk.StringVar()
+        self.show_pass_var = tk.BooleanVar(value=False)
+
+        ttk.Label(action_frame, text="Upstream iface:").pack(side=tk.LEFT, padx=(6,2))
         ttk.Entry(action_frame, width=12, textvariable=self.upstream_var).pack(side=tk.LEFT)
         ttk.Label(action_frame, text="Timeout(s):").pack(side=tk.LEFT, padx=(6,2))
-        self.timeout_var = tk.IntVar(value=15)
         ttk.Spinbox(action_frame, from_=5, to=300, width=6, textvariable=self.timeout_var).pack(side=tk.LEFT)
-        self.clone_vendor_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(action_frame, text='Clone vendor IEs', variable=self.clone_vendor_var).pack(side=tk.LEFT, padx=(8,2))
         ttk.Label(action_frame, text="SSID:").pack(side=tk.LEFT, padx=(8,2))
-        self.ssid_var = tk.StringVar()
         ttk.Entry(action_frame, width=16, textvariable=self.ssid_var).pack(side=tk.LEFT)
         ttk.Label(action_frame, text="Pass:").pack(side=tk.LEFT, padx=(6,2))
-        self.pass_var = tk.StringVar()
         self.pass_entry = ttk.Entry(action_frame, width=12, textvariable=self.pass_var, show='*')
         self.pass_entry.pack(side=tk.LEFT)
-        self.show_pass_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(action_frame, text='Show', variable=self.show_pass_var, command=self._toggle_password).pack(side=tk.LEFT, padx=(4,2))
-        ttk.Button(action_frame, text="Start Rogue AP", command=self.on_start_rogue).pack(side=tk.LEFT, padx=(6,2))
-        ttk.Button(action_frame, text="Stop Rogue AP", command=self.on_stop_rogue).pack(side=tk.LEFT, padx=(6,2))
-        ttk.Button(action_frame, text="Deauth Once", command=self.on_deauth_once).pack(side=tk.LEFT, padx=(6,2))
-        ttk.Button(action_frame, text="Scan Clients", command=self.on_scan_clients).pack(side=tk.LEFT, padx=(6,2))
-        action_frame.pack(anchor=tk.W, pady=(6,6))
+        action_frame.pack(anchor=tk.W, pady=(6,4))
+
+        # All action buttons grouped below the inputs
+        actions_buttons = ttk.Frame(left, style='Panel.TFrame')
+        ttk.Button(actions_buttons, text="Start Rogue AP", command=self.on_start_rogue).pack(side=tk.LEFT, padx=(6,2))
+        ttk.Button(actions_buttons, text="Stop Rogue AP", command=self.on_stop_rogue).pack(side=tk.LEFT, padx=(6,2))
+        ttk.Button(actions_buttons, text="Scan Clients", command=self.on_scan_clients).pack(side=tk.LEFT, padx=(12,2))
+        ttk.Button(actions_buttons, text="Deauth Once", command=self.on_deauth_once).pack(side=tk.LEFT, padx=(6,2))
+        ttk.Button(actions_buttons, text="Start Deauth", command=self.on_start_deauth).pack(side=tk.LEFT, padx=(6,2))
+        ttk.Button(actions_buttons, text="Stop Deauth", command=self.on_stop_deauth).pack(side=tk.LEFT, padx=(6,2))
+        actions_buttons.pack(anchor=tk.W, pady=(2,6))
+        
+        # MITM Attack buttons (separate row for visibility)
+        mitm_buttons = ttk.Frame(left, style='Panel.TFrame')
+        ttk.Label(mitm_buttons, text="Stealth MITM:", font=("Garamond", 11, 'bold')).pack(side=tk.LEFT, padx=(6,6))
+        ttk.Button(mitm_buttons, text="Start MITM Attack", command=self.on_start_mitm).pack(side=tk.LEFT, padx=(6,2))
+        ttk.Button(mitm_buttons, text="Stop MITM Attack", command=self.on_stop_mitm).pack(side=tk.LEFT, padx=(6,2))
+        ttk.Button(mitm_buttons, text="MITM Stats", command=self.on_mitm_stats).pack(side=tk.LEFT, padx=(6,2))
+        mitm_buttons.pack(anchor=tk.W, pady=(2,6))
 
         # Right: Clients list
         right = ttk.Frame(top, padding=8)
@@ -554,6 +626,63 @@ class GuiApp(tk.Tk):
         except Exception as e:
             self._append_log(f'Deauth failed: {e}')
 
+    def on_start_deauth(self):
+        """Start continuous deauth against selected AP, targeting all clients."""
+        if scanner is None or not hasattr(scanner, 'deauth_all'):
+            messagebox.showerror('Error', 'Continuous deauth feature unavailable')
+            return
+        if self.deauth_thread and self.deauth_thread.is_alive():
+            self._append_log('Deauth already running.')
+            return
+        bssid = self._get_selected_bssid()
+        if not bssid:
+            messagebox.showinfo('Deauth', 'Select an access point first.')
+            return
+        iface = self.iface_var.get().strip()
+        if not iface:
+            messagebox.showinfo('Deauth', 'Set the interface to use (e.g., wlan0 or wlan0mon).')
+            return
+        info = self._aps_info.get(bssid, {})
+        channel = info.get('channel')
+        try:
+            channel = int(channel) if channel is not None else None
+        except Exception:
+            channel = None
+        self.deauth_stop_event = threading.Event()
+        t = threading.Thread(target=self._run_deauth_thread, args=(bssid, iface, channel), daemon=True)
+        self.deauth_thread = t
+        t.start()
+
+    def _run_deauth_thread(self, bssid, iface, channel):
+        try:
+            self._append_log(f'Starting continuous deauth on {bssid} (channel={channel})...')
+            scanner.deauth_all(
+                bssid,
+                interface=iface,
+                channel=channel,
+                pps=35,
+                refresh_interval=18,
+                client_scan_timeout=6,
+                include_broadcast=True,
+                stop_event=self.deauth_stop_event,
+                log=self._append_log
+            )
+        except Exception as e:
+            self._append_log(f'Deauth error: {e}')
+
+    def on_stop_deauth(self):
+        if not self.deauth_thread or not self.deauth_thread.is_alive():
+            self._append_log('No deauth running.')
+            return
+        try:
+            self._append_log('Stopping continuous deauth...')
+            if self.deauth_stop_event:
+                self.deauth_stop_event.set()
+            self.deauth_thread.join(timeout=3)
+            self._append_log('Deauth stopped.')
+        except Exception as e:
+            self._append_log(f'Error stopping deauth: {e}')
+
     def on_start_rogue(self):
         if start_ap is None:
             messagebox.showerror('Error', 'ap_manager.start_ap not available')
@@ -785,6 +914,136 @@ class GuiApp(tk.Tk):
             messagebox.showinfo('Export', f'Exported {len(items)} rows to {path}')
         except Exception as e:
             messagebox.showerror('Export failed', str(e))
+    
+    # ------------------ MITM Attack Methods ------------------
+    def on_start_mitm(self):
+        """Start a stealth MITM attack against the selected AP."""
+        if MITMAttack is None:
+            messagebox.showerror('Error', 'MITM attack module not available')
+            return
+        
+        # Check if already running
+        if self.mitm_attack and self.mitm_attack.running:
+            messagebox.showinfo('MITM Attack', 'MITM attack already running. Stop it first.')
+            return
+        
+        # Get selected AP
+        bssid = self._get_selected_bssid()
+        if not bssid:
+            messagebox.showinfo('MITM Attack', 'Select a target access point first.')
+            return
+        
+        # Get AP info
+        info = self._aps_info.get(bssid, {})
+        ssid = info.get('ssid', '')
+        channel = info.get('channel')
+        vendor_ies = info.get('ies_hex') if self.clone_vendor_var.get() else None
+        beacon_int = info.get('beacon_int')
+        
+        if not ssid:
+            messagebox.showinfo('MITM Attack', 'Selected AP has no SSID. Scan APs first.')
+            return
+        
+        if not channel:
+            messagebox.showwarning('MITM Attack', 'Channel not detected. Using default channel 6.')
+            channel = 6
+        
+        # Get interface and other parameters
+        iface = self.iface_var.get().strip()
+        if not iface:
+            messagebox.showinfo('MITM Attack', 'Set the interface first (e.g., wlan0)')
+            return
+        
+        # Use base interface (not monitor)
+        base = self._base_iface(iface)
+        
+        # Get password
+        passwd = self.pass_var.get().strip()
+        if not passwd:
+            messagebox.showinfo('MITM Attack', 'Set a WPA password for the rogue AP.')
+            return
+        
+        # Get upstream interface
+        upstream = self.upstream_var.get().strip() or None
+        
+        # Start MITM in thread
+        t = threading.Thread(
+            target=self._start_mitm_thread,
+            args=(base, bssid, ssid, channel, passwd, upstream, vendor_ies, beacon_int),
+            daemon=True
+        )
+        t.start()
+    
+    def _start_mitm_thread(self, iface, bssid, ssid, channel, password, upstream, vendor_ies, beacon_int):
+        """Thread worker to start MITM attack."""
+        try:
+            self._append_log(f'Starting stealth MITM attack against {ssid} ({bssid})...')
+            self._append_log(f'Target channel: {channel}, Cloning vendor IEs: {bool(vendor_ies)}')
+            
+            self.mitm_attack = MITMAttack(
+                interface=iface,
+                target_bssid=bssid,
+                target_ssid=ssid,
+                target_channel=channel,
+                password=password,
+                upstream_iface=upstream,
+                vendor_ies=vendor_ies,
+                beacon_interval=beacon_int,
+                log_callback=self._append_log
+            )
+            
+            if self.mitm_attack.start():
+                self._append_log('✓ MITM attack started successfully!')
+                self._append_log('Attack is stealthy: not sending beacons, only responding to probes')
+            else:
+                self._append_log('✗ Failed to start MITM attack')
+                self.mitm_attack = None
+        except Exception as e:
+            self._append_log(f'Error starting MITM attack: {e}')
+            self.mitm_attack = None
+    
+    def on_stop_mitm(self):
+        """Stop the running MITM attack."""
+        if not self.mitm_attack:
+            self._append_log('No MITM attack running.')
+            return
+        
+        t = threading.Thread(target=self._stop_mitm_thread, daemon=True)
+        t.start()
+    
+    def _stop_mitm_thread(self):
+        """Thread worker to stop MITM attack."""
+        try:
+            self._append_log('Stopping MITM attack...')
+            self.mitm_attack.stop()
+            self._append_log('MITM attack stopped.')
+            self.mitm_attack = None
+        except Exception as e:
+            self._append_log(f'Error stopping MITM attack: {e}')
+    
+    def on_mitm_stats(self):
+        """Display MITM attack statistics."""
+        if not self.mitm_attack:
+            messagebox.showinfo('MITM Stats', 'No MITM attack running.')
+            return
+        
+        try:
+            stats = self.mitm_attack.get_stats()
+            msg = f"""MITM Attack Statistics:
+
+Target SSID: {stats['target_ssid']}
+Target BSSID: {stats['target_bssid']}
+Target Channel: {stats['target_channel']}
+
+Status: {'Running' if stats['running'] else 'Stopped'}
+Probes Received: {stats['probes_received']}
+Responses Sent: {stats['responses_sent']}
+
+Attack Mode: Stealth (no beacons, probe responses only)
+"""
+            messagebox.showinfo('MITM Attack Statistics', msg)
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to get stats: {e}')
 
 
 def main():
