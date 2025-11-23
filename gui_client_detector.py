@@ -10,7 +10,7 @@ import time
 import json
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from scapy.all import sniff, RadioTap, Dot11, Dot11Elt
+from scapy.all import sniff, RadioTap, Dot11, Dot11Elt, Dot11Beacon
 import statistics
 
 # local detector
@@ -35,9 +35,10 @@ SCANNER_PATH = APP_DIR / "scanner.py"
 class EnhancedGuiClientDetectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Rogue AP — Client Detector (Responsive)")
-        self.geometry("1200x820")
-        self.minsize(900, 600)
+        self.title("Rogue AP — Client Detector (Enhanced)")
+        # match main GUI start size and minimums for consistent UX
+        self.geometry("900x600")
+        self.minsize(1800, 1000)
 
         # ---------- Styling ----------
         self.style = ttk.Style(self)
@@ -52,6 +53,7 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         except Exception:
             pass
 
+        # Use same palette and ttk style settings as main GUI for consistent aesthetics
         self._bg_primary = "#f6f1e1"
         self._bg_panel = "#fefaf0"
         self._accent = "#b8893f"
@@ -61,18 +63,26 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         self.configure(bg=self._bg_primary)
 
         try:
+            # mirror gui.py style configuration
             self.style.configure('TFrame', background=self._bg_primary)
             self.style.configure('TLabel', background=self._bg_primary, foreground=self._text_main)
-            self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 13, 'bold'))
+            self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 12, 'bold'))
             self.style.configure('TButton', padding=6, background=self._accent, foreground="white", borderwidth=0)
-            self.style.map('TButton', background=[('active', self._accent_dark), ('disabled', '#d4c3a3')],
-                                         foreground=[('disabled', '#a99a84')])
-            self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main, rowheight=26)
+            self.style.map('TButton', background=[('active', self._accent_dark), ('disabled', '#d4c3a3')], foreground=[('disabled', '#a99a84')])
+            self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main)
             self.style.configure('Treeview.Heading', background='#f0e3c7', foreground=self._accent, font=("Garamond", 11, 'bold'))
+            self.style.map('Treeview', background=[('selected', '#ecd9b0')], foreground=[('selected', self._text_main)])
+            self.style.configure('Toolbar.TFrame', background=self._bg_primary)
             self.style.configure('Panel.TFrame', background=self._bg_panel)
             self.style.configure('Status.TLabel', background=self._bg_primary, foreground=self._muted, font=("Garamond", 10, 'italic'))
             self.style.configure('TEntry', fieldbackground=self._bg_panel, foreground=self._text_main)
+            self.style.map('TEntry', fieldbackground=[('disabled', '#ede1c7'), ('readonly', '#f2e7d0')])
+            self.style.configure('TSpinbox', fieldbackground=self._bg_panel, foreground=self._text_main)
+            self.style.map('TSpinbox', fieldbackground=[('disabled', '#ede1c7')])
+            self.style.configure('TCheckbutton', background=self._bg_primary, foreground=self._text_main)
+            self.style.map('TCheckbutton', foreground=[('disabled', self._muted)])
             self.style.configure('Horizontal.TProgressbar', background=self._accent, troughcolor='#efe5cc', bordercolor='#d4c3a3')
+            self.style.configure('TPanedwindow', background=self._bg_primary)
         except Exception:
             pass
 
@@ -144,23 +154,22 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         ttk.Button(filters, text="Save Whitelist", command=self.save_whitelist).grid(row=0, column=9, padx=(8,0))
         ttk.Button(filters, text="Load Whitelist", command=self.load_whitelist).grid(row=0, column=10, padx=(4,0))
 
-        # Paned window for left (AP list) and right (suspicious + details)
-        paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        paned.pack(side='top', fill='both', expand=True, padx=6, pady=(0,6))
+        filters.pack(fill=tk.X, pady=(2,4))
 
-        # Left pane
-        left_frame = ttk.Frame(paned, style='Panel.TFrame')
-        left_frame.grid_rowconfigure(1, weight=1)
-        left_frame.grid_columnconfigure(0, weight=1)
-        ttk.Label(left_frame, text="Access Points", style='Header.TLabel').grid(row=0, column=0, sticky='w', padx=6, pady=(6,2))
+    # ---------------------- Main panes ----------------------
+    def _create_main_panes(self):
+        # Outer vertical pane to hold top (APs + Suspicious) and bottom (Log)
+        outer = ttk.Panedwindow(self, orient=tk.VERTICAL)
+        
+        # Top horizontal split: APs left, Suspicious right
+        main = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
 
-        ap_table_frame = ttk.Frame(left_frame)
-        ap_table_frame.grid(row=1, column=0, sticky='nsew', padx=6, pady=(0,6))
-        ap_table_frame.grid_rowconfigure(0, weight=1)
-        ap_table_frame.grid_columnconfigure(0, weight=1)
-
+        # Left: APs
+        left = ttk.Frame(main, padding=(10, 8))
+        ttk.Label(left, text="Access Points", style='Header.TLabel').pack(anchor='w', pady=(0, 6))
+        ap_wrap = ttk.Frame(left, style='Panel.TFrame', padding=4)
         cols = ("bssid","ssid","channel")
-        self.tree = ttk.Treeview(ap_table_frame, columns=cols, show='headings', selectmode='browse')
+        self.tree = ttk.Treeview(ap_wrap, columns=cols, show='headings', selectmode='browse')
         self.tree.heading('bssid', text='BSSID')
         self.tree.heading('ssid', text='SSID')
         self.tree.heading('channel', text='Ch')
@@ -179,26 +188,18 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         self.tree.bind('<Double-1>', self._on_ap_double)
         self.tree.bind('<Button-3>', self._on_ap_right_click)
 
-        ctrl = ttk.Frame(left_frame)
-        ctrl.grid(row=2, column=0, sticky='w', padx=6, pady=(0,8))
-        ttk.Button(ctrl, text="Export CSV", command=self.export_csv).pack(side='left', padx=(0,6))
+        # Controls under AP table
+        ctrl = ttk.Frame(left, style='Panel.TFrame')
+        ttk.Button(ctrl, text="Export CSV", command=self.export_csv).pack(side='left', padx=(0,8))
         ttk.Button(ctrl, text="Copy Selected BSSID", command=self.copy_selected_bssid).pack(side='left')
+        ctrl.pack(anchor='w', pady=(8,0))
 
-        paned.add(left_frame, weight=3)
-
-        # Right pane
-        right_frame = ttk.Frame(paned, style='Panel.TFrame')
-        right_frame.grid_rowconfigure(2, weight=1)
-        right_frame.grid_columnconfigure(0, weight=1)
-        ttk.Label(right_frame, text="Suspicious APs", style='Header.TLabel').grid(row=0, column=0, sticky='w', padx=6, pady=(6,2))
-
-        susp_frame = ttk.Frame(right_frame)
-        susp_frame.grid(row=1, column=0, sticky='nsew', padx=6)
-        susp_frame.grid_rowconfigure(0, weight=1)
-        susp_frame.grid_columnconfigure(0, weight=1)
-
+        # Right: Suspicious APs and details
+        right = ttk.Frame(main, padding=(10, 8))
+        ttk.Label(right, text="Suspicious APs", style='Header.TLabel').pack(anchor='w', pady=(0, 6))
         scol = ("bssid","ssid","score","severity")
-        self.susp_tree = ttk.Treeview(susp_frame, columns=scol, show='headings')
+        susp_wrap = ttk.Frame(right, style='Panel.TFrame', padding=4)
+        self.susp_tree = ttk.Treeview(susp_wrap, columns=scol, show='headings')
         self.susp_tree.heading('bssid', text='BSSID')
         self.susp_tree.heading('ssid', text='SSID')
         self.susp_tree.heading('score', text='Score')
@@ -214,32 +215,53 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         self.susp_tree.bind('<<TreeviewSelect>>', self._on_susp_selected)
         self.susp_tree.bind('<Double-1>', self._on_susp_double)
 
-        # legend + details below susp tree
-        weights_legend = ttk.Frame(right_frame)
-        weights_legend.grid(row=2, column=0, sticky='ew', padx=6, pady=(8,4))
-        ttk.Label(weights_legend, text="Heuristic weights:", font=("Garamond", 10, 'bold')).grid(row=0, column=0, sticky='w')
+        # Color tags for severity
+        try:
+            self.tree.tag_configure('benign', background='#e8f7e8')  # soft green
+            self.tree.tag_configure('suspicious', background='#fff7e0')  # soft yellow
+            self.tree.tag_configure('highly suspicious', background='#ffe3e3')  # soft red
+            self.susp_tree.tag_configure('benign', background='#e8f7e8')
+            self.susp_tree.tag_configure('suspicious', background='#fff7e0')
+            self.susp_tree.tag_configure('highly suspicious', background='#ffe3e3')
+        except Exception:
+            pass
+
+        # Reasons / Details
+        ttk.Label(right, text="Reasons / Details", style='Header.TLabel').pack(anchor='w', pady=(10, 4))
+        
+        # Small weight legend to explain heuristics
+        weights_legend = ttk.Frame(right, style='Panel.TFrame', padding=(6, 4))
+        ttk.Label(weights_legend, text="Heuristic weights:", font=("Garamond", 10, 'bold')).pack(anchor='w')
+        # Build legend text from self.heuristic_weights in a single line for compactness
         legend_items = []
         for k, v in self.heuristic_weights.items():
             legend_items.append(f"{k}={v}")
-        ttk.Label(weights_legend, text=", ".join(legend_items), wraplength=360).grid(row=1, column=0, sticky='w')
+        ttk.Label(weights_legend, text=", ".join(legend_items), wraplength=400, style='TLabel', font=("Garamond", 9)).pack(anchor='w', pady=(2,0))
+        weights_legend.pack(fill='x', pady=(0, 6))
 
-        # reasons / details text
-        self.reasons_text = tk.Text(right_frame, height=12, wrap='word', state='disabled', background=self._bg_panel)
-        self.reasons_text.grid(row=3, column=0, sticky='nsew', padx=6, pady=(4,8))
-        right_frame.grid_rowconfigure(3, weight=1)
+        reasons_wrap = ttk.Frame(right, style='Panel.TFrame', padding=4)
+        self.reasons_text = tk.Text(reasons_wrap, wrap='word', state='disabled', 
+                                   background=self._bg_panel, fg=self._text_main,
+                                   relief='flat', highlightthickness=1,
+                                   highlightbackground='#dec79a', highlightcolor='#dec79a')
+        reasons_scroll = ttk.Scrollbar(reasons_wrap, orient='vertical', command=self.reasons_text.yview)
+        self.reasons_text.configure(yscrollcommand=reasons_scroll.set)
+        self.reasons_text.pack(side='left', fill=tk.BOTH, expand=True)
+        reasons_scroll.pack(side='right', fill='y')
+        reasons_wrap.pack(fill=tk.BOTH, expand=True)
 
-        paned.add(right_frame, weight=2)
-
-        # bottom log
-        bottom = ttk.Frame(self, padding=8)
-        bottom.pack(side='bottom', fill='both', expand=False, padx=6, pady=(0,6))
-        ttk.Label(bottom, text="Log", style='Header.TLabel').pack(anchor='w')
-        log_wrap = ttk.Frame(bottom, style='Panel.TFrame')
-        log_wrap.pack(fill='both', expand=True, pady=(6,0))
-        log_wrap.grid_rowconfigure(0, weight=1)
-        log_wrap.grid_columnconfigure(0, weight=1)
-        self.log_text = tk.Text(log_wrap, height=8, wrap='none', background=self._bg_panel)
-        self.log_text.grid(row=0, column=0, sticky='nsew')
+        main.add(left, weight=3)
+        main.add(right, weight=2)
+        
+        # Bottom log (resizable as part of outer pane)
+        bottom = ttk.Frame(outer, padding=(10, 8))
+        ttk.Label(bottom, text="Log", style='Header.TLabel').pack(anchor='w', pady=(0, 6))
+        log_wrap = ttk.Frame(bottom, style='Panel.TFrame', padding=4)
+        self.log_text = tk.Text(log_wrap, wrap='none', 
+                               background=self._bg_panel, fg=self._text_main,
+                               relief='flat', highlightthickness=1,
+                               highlightbackground='#dec79a', highlightcolor='#dec79a',
+                               insertbackground=self._accent)
         ysb_log = ttk.Scrollbar(log_wrap, orient='vertical', command=self.log_text.yview)
         ysb_log.grid(row=0, column=1, sticky='ns')
         xsb_log = ttk.Scrollbar(log_wrap, orient='horizontal', command=self.log_text.xview)
@@ -247,16 +269,19 @@ class EnhancedGuiClientDetectorApp(tk.Tk):
         self.log_text.configure(yscrollcommand=ysb_log.set, xscrollcommand=xsb_log.set)
         self.log_text.configure(state='disabled')
 
-        # style tags
-        try:
-            self.tree.tag_configure('benign', background='#e8f7e8')
-            self.tree.tag_configure('suspicious', background='#fff7e0')
-            self.tree.tag_configure('highly suspicious', background='#ffe3e3')
-            self.susp_tree.tag_configure('benign', background='#e8f7e8')
-            self.susp_tree.tag_configure('suspicious', background='#fff7e0')
-            self.susp_tree.tag_configure('highly suspicious', background='#ffe3e3')
-        except Exception:
-            pass
+        # Add to outer pane with proper weights
+        outer.add(main, weight=3)
+        outer.add(bottom, weight=1)
+        
+        self.left = left
+        self.right = right
+        self.bottom = bottom
+        self.main = main
+        self.pw = outer
+
+    def _layout(self):
+        # Pack outer paned window
+        self.pw.pack(fill=tk.BOTH, expand=True)
 
     # ---------------------- Shortcuts ----------------------
     def _bind_shortcuts(self):

@@ -22,8 +22,6 @@ import time
 import sqlite3
 import json
 import os
-from collections import defaultdict, deque
-from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -33,327 +31,34 @@ except Exception:
     scanner = None
 
 try:
-    from scapy.all import sniff, Dot11, Dot11Beacon, Dot11Elt, RadioTap
+    from scapy.all import sniff
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
 
+# Import core detection logic from server_detector module
+try:
+    from server_detector import (
+        init_db, Scorer, extract_beacon_fields,
+        now_ts, normalize_ssid, oui_of_mac,
+        ALERT_THRESHOLD
+    )
+except Exception as e:
+    print(f"Failed to import server_detector: {e}")
+    sys.exit(1)
+
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "ap_local.db"
 WHITELIST_FILE = APP_DIR / "whitelist.json"
-ALERT_THRESHOLD = 50
-RSSI_JUMP_DB = 15
-RSSI_JUMP_WINDOW = 5
-
-
-# Utility functions from server_detector.py
-def now_ts():
-    return int(time.time())
-
-def iso_ts(ts=None):
-    return datetime.utcfromtimestamp(ts or time.time()).isoformat() + "Z"
-
-def normalize_ssid(ssid_raw):
-    try:
-        s = ssid_raw.strip()
-        return s.lower()
-    except:
-        return ssid_raw
-
-def oui_of_mac(mac):
-    if not mac:
-        return ""
-    return mac.replace(":", "").lower()[:6]
-
-def levenshtein(a, b):
-    if a == b:
-        return 0
-    if len(a) == 0:
-        return len(b)
-    if len(b) == 0:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        cur = [i] + [0] * len(b)
-        for j, cb in enumerate(b, start=1):
-            cost = 0 if ca == cb else 1
-            cur[j] = min(prev[j] + 1, cur[j-1] + 1, prev[j-1] + cost)
-        prev = cur
-    return prev[-1]
-
-
-# DB functions
-def init_db(conn):
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS ap_docs (
-        id INTEGER PRIMARY KEY,
-        ssid_raw TEXT,
-        ssid_norm TEXT,
-        bssid TEXT,
-        first_seen INTEGER,
-        last_seen INTEGER,
-        sample_rssi INTEGER,
-        channel INTEGER,
-        rsn_hashes TEXT,
-        ouis TEXT,
-        beacon_intervals TEXT,
-        seq_last INTEGER,
-        beacon_ts_hist TEXT,
-        seen_count INTEGER DEFAULT 0,
-        last_score INTEGER DEFAULT 0
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY,
-        ts INTEGER,
-        ssid_raw TEXT,
-        ssid_norm TEXT,
-        bssid TEXT,
-        frame_subtype TEXT,
-        rssi INTEGER,
-        channel INTEGER,
-        seq_num INTEGER,
-        beacon_ts INTEGER,
-        rsn_hash TEXT,
-        vendor_summary TEXT
-    )
-    """)
-    conn.commit()
-
-
-# Scoring engine
-class Scorer:
-    def __init__(self, conn, whitelist):
-        self.conn = conn
-        self.whitelist = whitelist
-        self.rssi_hist = defaultdict(lambda: deque())
-
-    def update_rssi_hist(self, key, rssi):
-        h = self.rssi_hist[key]
-        ts = time.time()
-        h.append((ts, rssi))
-        while h and (ts - h[0][0]) > RSSI_JUMP_WINDOW:
-            h.popleft()
-
-    def compute_score(self, ssid_norm, bssid):
-        cur = self.conn.cursor()
-        cur.execute("SELECT * FROM ap_docs WHERE ssid_norm=? AND bssid=?", (ssid_norm, bssid))
-        row = cur.fetchone()
-        if not row:
-            return 0, []
-        cols = [c[0] for c in cur.description]
-        doc = dict(zip(cols, row))
-        evidence = []
-        score = 0
-
-        rsn_hashes = set(filter(None, (doc.get("rsn_hashes") or "").split(",")))
-        ouis = set(filter(None, (doc.get("ouis") or "").split(",")))
-        beacon_intervals = set(filter(None, (doc.get("beacon_intervals") or "").split(",")))
-
-        # Whitelist check
-        for item in self.whitelist.get("known_ssids", []):
-            if item.get("ssid","").lower() == ssid_norm:
-                allowed_ouis = set(o.lower() for o in item.get("ouis", []))
-                if ouis and allowed_ouis and ouis.issubset(allowed_ouis):
-                    evidence.append("whitelist_match")
-                    score = max(score - 20, 0)
-                break
-
-        # Check whitelisted BSSIDs
-        whitelist_bssids = set(b.lower() for b in self.whitelist.get("known_bssids", []))
-        if bssid.lower() in whitelist_bssids:
-            evidence.append("whitelisted_bssid")
-            score = max(score - 30, 0)
-
-        # Duplicate-SSID detection
-        cur.execute("SELECT DISTINCT bssid, rsn_hashes, ouis FROM ap_docs WHERE ssid_norm=?", (ssid_norm,))
-        rows = cur.fetchall()
-        bssid_list = [r[0] for r in rows]
-        if len(bssid_list) > 1:
-            # Check if this SSID is whitelisted
-            is_ssid_whitelisted = False
-            for item in self.whitelist.get("known_ssids", []):
-                if item.get("ssid","").lower() == ssid_norm:
-                    is_ssid_whitelisted = True
-                    break
-            
-            # Check if ANY BSSID for this SSID is whitelisted
-            whitelist_bssids = set(b.lower() for b in self.whitelist.get("known_bssids", []))
-            any_bssid_whitelisted = any(b.lower() in whitelist_bssids for b in bssid_list)
-            current_bssid_whitelisted = bssid.lower() in whitelist_bssids
-            
-            rsn_set = set()
-            oui_set = set()
-            for r in rows:
-                rsn_set.update(filter(None, (r[1] or "").split(",")))
-                oui_set.update(filter(None, (r[2] or "").split(",")))
-            
-            # Case 1: One BSSID is whitelisted, but current BSSID is NOT - BIG PENALTY (likely rogue)
-            if any_bssid_whitelisted and not current_bssid_whitelisted:
-                score += 60  # Major penalty - impersonating whitelisted network
-                evidence.append("duplicate_ssid_impersonating_whitelisted_bssid")
-                
-                if len(rsn_set) > 1:
-                    score += 40
-                    evidence.append("rogue_ap_different_security_than_legitimate")
-                
-                if len(oui_set) > 1:
-                    score += 40
-                    evidence.append("rogue_ap_different_vendor_than_legitimate")
-            
-            # Case 2: No BSSIDs whitelisted - lesser penalty (could be legitimate multi-AP setup)
-            elif not any_bssid_whitelisted and not is_ssid_whitelisted:
-                if len(rsn_set) > 1:
-                    score += 25
-                    evidence.append("duplicate_ssid_rsn_mismatch_not_whitelisted")
-                else:
-                    score += 15
-                    evidence.append("duplicate_ssid_multiple_bssids_not_whitelisted")
-                
-                if len(oui_set) > 1:
-                    score += 20
-                    evidence.append("duplicate_ssid_different_vendors")
-            
-            # Case 3: Current BSSID is whitelisted - minimal penalty
-            elif current_bssid_whitelisted or is_ssid_whitelisted:
-                if len(rsn_set) > 1:
-                    score += 10
-                    evidence.append("duplicate_ssid_rsn_mismatch")
-                else:
-                    score += 5
-                    evidence.append("duplicate_ssid_multiple_bssids")
-
-        # Fingerprint mismatch
-        if len(ouis) > 1:
-            score += 15
-            evidence.append("multiple_ouis_for_bssid")
-
-        if len(rsn_hashes) > 1:
-            score += 20
-            evidence.append("rsn_hashes_multiple_for_bssid")
-
-        # Beacon interval anomalies
-        try:
-            intervals = [int(x) for x in beacon_intervals if x]
-            if intervals:
-                for iv in intervals:
-                    if iv < 50 or iv > 200:
-                        score += 5
-                        evidence.append(f"odd_beacon_interval:{iv}")
-                        break
-        except Exception:
-            pass
-
-        # Beacon timestamp monotonicity
-        try:
-            hist = json.loads(doc.get("beacon_ts_hist") or "[]")
-            if len(hist) >= 3:
-                monotonic = all(hist[i] <= hist[i+1] for i in range(len(hist)-1))
-                if not monotonic:
-                    score += 15
-                    evidence.append("beacon_timestamp_nonmonotonic")
-        except Exception:
-            pass
-
-        # RSSI jump detection
-        key = f"{ssid_norm}|{bssid}"
-        hist = self.rssi_hist.get(key, [])
-        if len(hist) >= 2:
-            vals = [v for (_, v) in hist]
-            if max(vals) - min(vals) > RSSI_JUMP_DB:
-                score += 5
-                evidence.append("abrupt_rssi_jump")
-
-        # SSID typo/lookalike
-        for item in self.whitelist.get("known_ssids", []):
-            known = item.get("ssid", "").lower()
-            if known and known != ssid_norm:
-                d = levenshtein(known, ssid_norm)
-                if d <= 2:
-                    score += 10
-                    evidence.append(f"ssid_typo_like:{known}:{d}")
-
-        # High-entropy SSID
-        nonalnum = sum(1 for c in ssid_norm if not c.isalnum())
-        if nonalnum > max(3, len(ssid_norm)//4):
-            score += 5
-            evidence.append("high_entropy_ssid")
-
-        final = min(100, score)
-        return final, evidence
-
-
-# Packet extraction
-def extract_beacon_fields(pkt):
-    if not pkt.haslayer(Dot11):
-        return None
-    dot = pkt[Dot11]
-    if pkt.type != 0 or dot.subtype not in (8, 5):
-        return None
-
-    bssid = dot.addr3
-    seq = None
-    rssi = None
-    try:
-        seq = dot.SC >> 4
-    except:
-        pass
-    try:
-        if pkt.haslayer(RadioTap) and hasattr(pkt, "dBm_AntSignal"):
-            rssi = int(pkt.dBm_AntSignal)
-    except:
-        pass
-
-    elt = pkt.getlayer(Dot11Elt)
-    ssid_raw = ""
-    channel = None
-    rsn = ""
-    vendor_sum = ""
-    beacon_interval = None
-    beacon_ts = None
-
-    while elt:
-        if elt.ID == 0 and hasattr(elt, 'info'):
-            try:
-                ssid_raw = elt.info.decode(errors='ignore')
-            except:
-                ssid_raw = str(elt.info)
-        if elt.ID == 3:
-            try:
-                channel = elt.info[0]
-            except:
-                pass
-        if elt.ID == 48:
-            try:
-                rsn = elt.info.hex()
-            except:
-                rsn = ""
-        if elt.ID == 221:
-            try:
-                vendor_sum += "v:" + elt.info[:3].hex() + "|"
-            except:
-                pass
-        elt = elt.payload.getlayer(Dot11Elt)
-
-    if pkt.haslayer(Dot11Beacon):
-        try:
-            beacon_interval = pkt[Dot11Beacon].beacon_interval
-            beacon_ts = int(pkt[Dot11Beacon].timestamp)
-        except:
-            pass
-
-    ssid_norm = normalize_ssid(ssid_raw or "<hidden>")
-    return (ssid_raw, ssid_norm, bssid, channel, rssi, seq, beacon_ts, rsn, vendor_sum, beacon_interval)
 
 
 class GuiServerDetectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Rogue AP — Server Detector GUI")
-        self.geometry("1400x900")
-        self.minsize(1200, 800)
+        # match main GUI start size and minimums for consistent UX
+        self.geometry("900x600")
+        self.minsize(1800, 1000)
 
         # Styling
         self.style = ttk.Style(self)
@@ -364,6 +69,7 @@ class GuiServerDetectorApp(tk.Tk):
         default_font = ("Garamond", 11)
         self.option_add("*Font", default_font)
 
+        # Use same palette and ttk style settings as main GUI for consistent aesthetics
         self._bg_primary = "#f6f1e1"
         self._bg_panel = "#fefaf0"
         self._accent = "#b8893f"
@@ -372,17 +78,24 @@ class GuiServerDetectorApp(tk.Tk):
         self._muted = "#6c5434"
         self.configure(bg=self._bg_primary)
 
-        self.style.configure('TFrame', background=self._bg_primary)
-        self.style.configure('TLabel', background=self._bg_primary, foreground=self._text_main)
-        self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 12, 'bold'))
-        self.style.configure('Panel.TFrame', background=self._bg_panel)
-        self.style.configure('Status.TLabel', background=self._bg_primary, foreground=self._muted, font=("Garamond", 10, 'italic'))
-        self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main, rowheight=26)
-        self.style.configure('Treeview.Heading', background='#f0e3c7', foreground=self._accent, font=("Garamond", 11, 'bold'))
-        self.style.configure('Horizontal.TProgressbar', background=self._accent, troughcolor='#efe5cc')
-
-        # Color tags
-        self.style.map('Treeview', background=[('selected', '#ecd9b0')], foreground=[('selected', self._text_main)])
+        try:
+            self.style.configure('TFrame', background=self._bg_primary)
+            self.style.configure('TLabel', background=self._bg_primary, foreground=self._text_main)
+            self.style.configure('Header.TLabel', background=self._bg_primary, foreground=self._accent, font=("Garamond", 12, 'bold'))
+            self.style.configure('Toolbar.TFrame', background=self._bg_primary)
+            self.style.configure('Panel.TFrame', background=self._bg_panel)
+            self.style.configure('Status.TLabel', background=self._bg_primary, foreground=self._muted, font=("Garamond", 10, 'italic'))
+            self.style.configure('Treeview', background=self._bg_panel, fieldbackground=self._bg_panel, foreground=self._text_main)
+            self.style.map('Treeview', background=[('selected', '#ecd9b0')], foreground=[('selected', self._text_main)])
+            self.style.configure('Treeview.Heading', background='#f0e3c7', foreground=self._accent, font=("Garamond", 11, 'bold'))
+            self.style.configure('TButton', padding=6, background=self._accent, foreground="white", borderwidth=0)
+            self.style.map('TButton', background=[('active', self._accent_dark), ('disabled', '#d4c3a3')], foreground=[('disabled', '#a99a84')])
+            self.style.configure('TEntry', fieldbackground=self._bg_panel, foreground=self._text_main)
+            self.style.map('TEntry', fieldbackground=[('disabled', '#ede1c7'), ('readonly', '#f2e7d0')])
+            self.style.configure('Horizontal.TProgressbar', background=self._accent, troughcolor='#efe5cc', bordercolor='#d4c3a3')
+            self.style.configure('TPanedwindow', background=self._bg_primary)
+        except Exception:
+            pass
 
         # State
         self._queue = queue.Queue()
@@ -401,6 +114,9 @@ class GuiServerDetectorApp(tk.Tk):
         # Initialize DB
         self._init_database()
         self._load_whitelist()
+        
+        # Load existing suspicious APs from database
+        self._load_suspicious_aps_from_db()
 
         # Poll queue
         self.after(100, self._process_queue)
@@ -429,6 +145,44 @@ class GuiServerDetectorApp(tk.Tk):
                 self._append_log("No whitelist file found, starting with empty whitelist")
         except Exception as e:
             self._append_log(f"Whitelist load failed: {e}")
+    
+    def _load_suspicious_aps_from_db(self):
+        """Load existing suspicious APs (score >= 50) from database on startup"""
+        try:
+            if not DB_PATH.exists():
+                return
+            conn = sqlite3.connect(str(DB_PATH))
+            cur = conn.cursor()
+            cur.execute('SELECT bssid, ssid_raw, last_score FROM ap_docs WHERE last_score >= ? ORDER BY last_score DESC', (ALERT_THRESHOLD,))
+            rows = cur.fetchall()
+            conn.close()
+            
+            if rows:
+                self._append_log(f"Found {len(rows)} suspicious AP(s) in database")
+                for bssid, ssid_raw, last_score in rows:
+                    # Add to suspicious APs dictionary
+                    self._suspicious_aps[bssid] = {
+                        'ssid': ssid_raw,
+                        'score': last_score,
+                        'evidence': []  # Evidence not stored in DB, will be recalculated on detection
+                    }
+                    
+                    # Determine severity tag
+                    tag = ''
+                    if last_score >= 70:
+                        tag = 'high'
+                    elif last_score >= 50:
+                        tag = 'medium'
+                    else:
+                        tag = 'low'
+                    
+                    # Add to suspicious tree
+                    self.susp_tree.insert('', tk.END, values=(bssid, ssid_raw, last_score), tags=(tag,))
+            
+            # Also refresh the main AP table
+            self.refresh_db_now()
+        except Exception as e:
+            self._append_log(f"Failed to load suspicious APs: {e}")
 
     def _create_toolbar(self):
         toolbar = ttk.Frame(self, padding=(6,6), style='TFrame')
@@ -500,6 +254,9 @@ class GuiServerDetectorApp(tk.Tk):
         wrap.grid_columnconfigure(0, weight=1)
         wrap.grid_rowconfigure(0, weight=1)
         wrap.pack(fill=tk.BOTH, expand=True)
+        
+        # Bind click event to show evidence for any AP
+        self.tree.bind('<<TreeviewSelect>>', self._on_ap_selected)
 
         # Color tags for severity
         try:
@@ -539,8 +296,8 @@ class GuiServerDetectorApp(tk.Tk):
         except:
             pass
 
-        # Reasons display
-        ttk.Label(right, text="Detection Reasons", style='Header.TLabel').pack(anchor=tk.W, pady=(8,4))
+        # Evidences display
+        ttk.Label(right, text="Evidences", style='Header.TLabel').pack(anchor=tk.W, pady=(8,4))
         self.reasons_text = tk.Text(right, height=12, wrap='word', state='disabled', background=self._bg_panel, fg=self._text_main)
         self.reasons_text.pack(fill=tk.BOTH, expand=True)
 
@@ -870,8 +627,27 @@ class GuiServerDetectorApp(tk.Tk):
         except Exception as e:
             self._queue.put(('log', f'Clear DB failed: {e}'))
 
+    # Main AP table selection
+    def _on_ap_selected(self, event):
+        """Handler for clicking any AP in the main table"""
+        try:
+            sel = self.tree.selection()
+            if not sel:
+                return
+            iid = sel[0]
+            vals = self.tree.item(iid, 'values')
+            bssid = vals[0] if len(vals) > 0 else ""
+            ssid = vals[1] if len(vals) > 1 else ""
+            
+            # Recalculate evidence from database
+            evidence = self._compute_evidence_for_ap(bssid, ssid)
+            self._show_evidence(evidence, bssid, ssid)
+        except Exception as e:
+            self._append_log(f"Error showing AP details: {e}")
+    
     # Suspicious AP selection
     def _on_susp_selected(self, event):
+        """Handler for clicking suspicious APs"""
         try:
             sel = self.susp_tree.selection()
             if not sel:
@@ -879,21 +655,62 @@ class GuiServerDetectorApp(tk.Tk):
             iid = sel[0]
             vals = self.susp_tree.item(iid, 'values')
             bssid = vals[0]
+            ssid = vals[1] if len(vals) > 1 else ""
             
-            if bssid in self._suspicious_aps:
-                info = self._suspicious_aps[bssid]
-                self._show_reasons(info['evidence'])
-        except Exception:
-            pass
+            # Recalculate evidence from database
+            evidence = self._compute_evidence_for_ap(bssid, ssid)
+            self._show_evidence(evidence, bssid, ssid)
+        except Exception as e:
+            self._append_log(f"Error showing AP details: {e}")
 
-    def _show_reasons(self, evidence):
+    def _compute_evidence_for_ap(self, bssid, ssid):
+        """Compute evidence/reasons for a given AP by analyzing its database record"""
+        try:
+            if not self._db_conn:
+                return ["Database not available"]
+            
+            ssid_norm = normalize_ssid(ssid)
+            
+            # Build current whitelist
+            whitelist = self._build_whitelist()
+            
+            # Create a temporary scorer to compute evidence
+            scorer = Scorer(self._db_conn, whitelist)
+            
+            # Compute score and evidence
+            score, evidence = scorer.compute_score(ssid_norm, bssid)
+            
+            if not evidence:
+                return ["No specific detection reasons (may be legitimate or newly discovered)"]
+            
+            return evidence
+        except Exception as e:
+            return [f"Error computing evidence: {e}"]
+    
+    def _show_evidence(self, evidence, bssid, ssid):
+        """Display evidence for the selected AP"""
         self.reasons_text.configure(state='normal')
         self.reasons_text.delete(1.0, 'end')
+        
+        # Show AP header info
+        self.reasons_text.insert('end', f"AP: {ssid}\n", 'header')
+        self.reasons_text.insert('end', f"BSSID: {bssid}\n\n", 'subheader')
+        
         if not evidence:
-            self.reasons_text.insert('end', "No specific reasons detected.\n")
+            self.reasons_text.insert('end', "No evidence detected.\n")
+            self.reasons_text.insert('end', "\nThis AP appears to be legitimate based on current analysis.")
         else:
+            self.reasons_text.insert('end', f"Found {len(evidence)} evidence item(s):\n\n")
             for reason in evidence:
                 self.reasons_text.insert('end', f"• {reason}\n")
+        
+        # Configure text tags for formatting
+        try:
+            self.reasons_text.tag_configure('header', font=('Garamond', 12, 'bold'), foreground=self._accent)
+            self.reasons_text.tag_configure('subheader', font=('Garamond', 10), foreground=self._muted)
+        except:
+            pass
+        
         self.reasons_text.configure(state='disabled')
 
     # Whitelist save/load
@@ -967,6 +784,29 @@ class GuiServerDetectorApp(tk.Tk):
                         self.tree.insert('', tk.END, values=(bssid or '', ssid_raw or '', last_score or 0, 
                                                              last_seen_fmt, channel or '', sample_rssi or '', seen_count or 0),
                                         tags=(tag,))
+                        
+                        # Update suspicious APs panel if score >= threshold
+                        if last_score >= ALERT_THRESHOLD:
+                            # Check if already in suspicious tree
+                            found = False
+                            for iid in self.susp_tree.get_children():
+                                if self.susp_tree.item(iid, 'values')[0] == bssid:
+                                    # Update existing entry
+                                    susp_tag = 'high' if last_score >= 70 else ('medium' if last_score >= 50 else 'low')
+                                    self.susp_tree.item(iid, values=(bssid, ssid_raw, last_score), tags=(susp_tag,))
+                                    found = True
+                                    break
+                            
+                            if not found:
+                                # Add new suspicious AP
+                                susp_tag = 'high' if last_score >= 70 else ('medium' if last_score >= 50 else 'low')
+                                self.susp_tree.insert('', tk.END, values=(bssid, ssid_raw, last_score), tags=(susp_tag,))
+                                if bssid not in self._suspicious_aps:
+                                    self._suspicious_aps[bssid] = {
+                                        'ssid': ssid_raw,
+                                        'score': last_score,
+                                        'evidence': []
+                                    }
                 elif kind == 'alert':
                     bssid, ssid, score, evidence = item[1]
                     self._append_log(f"ALERT: {ssid} ({bssid}) - Score: {score}")
