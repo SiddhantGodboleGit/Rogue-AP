@@ -1,0 +1,101 @@
+﻿Final Project Report: [Insert Project Title Here]
+Team Members:
+* [Name 1] (Roll No: [ ])
+* [Name 2] (Roll No: [ ])
+* [Name 3] (Roll No: [ ])
+
+
+1. Introduction
+1.1 Problem Statement
+[Briefly restate the core problem you are solving. (1-2 paragraphs)]
+1.2 Motivation
+[Explain why this problem matters. Discuss the security impact and why a solution is necessary.]
+1.3 Key Objectives
+[List the 2-3 main objectives you proposed at the start of the term. These should match your initial proposal.]
+* Objective 1: ...
+* Objective 2: ...
+2. Threat Model and Assumptions
+2.1 Threat Model
+[Describe your specific threat model. Define the attacker's capabilities clearly (e.g., Is the attacker an Insider or Outsider? Active or Passive? What resources do they have?)]
+2.2 Key Assumptions
+[List the critical assumptions made for your project (e.g., "We assume the attacker knows the SSID but not the WPA3 password").]
+3. System Architecture & Methodology
+3.1 High-Level Design
+[Insert your final system Block Diagram here. Describe the overall architecture and data flow.]
+3.2 Core Modules
+[Describe the key components of your system (e.g., Attack Module, Detection Engine, Logging Server). Explain what each module does.]
+
+
+4. Implementation Details
+4.1 Hardware Setup
+[List the hardware used (e.g., Raspberry Pi 4, Alfa Wi-Fi Cards, Laptops). Include a diagram or photo of your physical testbed setup.]
+4.2 Software Stack
+[List the key libraries, tools, and frameworks used (e.g., hostapd, Scapy, Aircrack-ng, Python).]
+4.3 Key Algorithms and Logic
+[Provide the pseudo-code or a flowchart for the most critical part of your solution. Explain the logic behind your specific implementation.]
+4.4 Code Structure
+[Briefly describe how your code is organized in your repository (e.g., which script handles the attack vs. the defense).]
+
+
+5. Experimental Setup & Evaluation
+5.1 Testbed Environment
+[Describe the environment where you ran your experiments (e.g., Lab setting, isolated network, specific distance between nodes).]
+5.2 Test Scenarios
+[List the specific scenarios you tested (e.g., "Scenario A: Weak Password", "Scenario B: WPA3-SAE Dictionary Attack").]
+5.3 Metrics and Baselines
+* Metrics: [What did you measure? (e.g., Handshake capture time, Decryption success rate, CPU load).]
+* Baselines: [What are you comparing your results against? (e.g., Standard WPA2 performance, existing tools).]
+
+
+
+
+
+
+
+
+6. Results and Analysis
+6.1 Quantitative Results
+[Insert your plots, graphs, and tables here. Ensure all axes are labeled and figures have captions.]
+6.2 Analysis
+[Crucial Section: Do not just describe the numbers. Explain why the results look the way they do. (e.g., "The capture time increased in Scenario B because of the additional SAE overhead...").]
+6.3 Comparison with Objectives
+[Review your objectives from Section 1.3. State the final status of each (Completed, Partially Completed, Infeasible) and explain any deviations.]
+________________
+
+
+7. Project Management & AI Usage
+7.1 Work Distribution
+[Fill in the table below detailing individual contributions.]
+Team Member Name
+	Core Responsibility
+	Key Tasks & Contributions
+	[Student 1]
+	[e.g., Attack Scripting]
+	[Detailed tasks...]
+	[Student 2]
+	[e.g., Defense Logic]
+	[Detailed tasks...]
+	[Student 3]
+	[e.g., Testing & Reports]
+	[Detailed tasks...]
+	7.2 Leveraging LLMs (AI Usage Declaration)
+[Be transparent about how you used AI tools like ChatGPT, Gemini, or Copilot.]
+* Code Assistance: [Did you use it for debugging or boilerplate code? Mention specific examples.]
+* Documentation: [Did you use it for drafting reports or slides?]
+* Impact: [Briefly mention where it helped accelerate your work or where it might have provided incorrect information that you had to fix.]
+________________
+
+
+8. Conclusion and Future Work
+8.1 Summary
+[Provide a 2-3 sentence summary of the project's final outcome and impact.]
+8.2 Future Work
+[If you had another semester to work on this, what features or improvements would you add?]
+________________
+
+
+9. References
+9.1 GitHub Repository
+[Insert the link to your project's source code repository here.]
+9.2 Bibliography
+[List all papers, standards (IEEE 802.11), and articles cited in the report or repos you used for your project.]

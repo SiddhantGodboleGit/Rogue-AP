@@ -35,6 +35,9 @@ class APManager:
                  bssid: Optional[str] = None):
         self.iface = iface
         self.ssid = ssid
+        # Validate WPA passphrase length (8-63 characters for WPA2)
+        if len(passphrase) < 8 or len(passphrase) > 63:
+            raise ValueError(f"WPA passphrase must be 8-63 characters long (got {len(passphrase)})")
         self.passphrase = passphrase
         self.ap_ip = ap_ip
         self.dhcp_start = dhcp_start
@@ -179,11 +182,10 @@ class APManager:
             raise RuntimeError(
                 f"Wireless interface '{base}' not found. Ensure monitor mode is stopped or select the correct interface.")
 
-        # Standard preparation: bring down, flush, assign IP, bring up.
+        # Preparation: bring down, flush addresses. Do NOT bring up yet.
+        # IP will be assigned AFTER hostapd starts to avoid conflicts.
         self._run(["ip", "link", "set", base, "down"], check=False)
         self._run(["ip", "addr", "flush", "dev", base], check=False)
-        self._run(["ip", "addr", "add", self.ap_ip, "dev", base], check=True)
-        self._run(["ip", "link", "set", base, "up"], check=True)
 
     def _write_configs(self):
         self._tmpdir = Path(tempfile.mkdtemp(prefix="pyap_"))
@@ -215,16 +217,31 @@ class APManager:
             "wmm_enabled=1",
             "auth_algs=1",
             "ignore_broadcast_ssid=0",
+            # MAC address access control
+            "macaddr_acl=0",
             # Regulatory settings
             f"country_code={country_code}",
             "ieee80211d=1",
             "ieee80211h=1",
+            # WPA2 settings
             "wpa=2",
             f"wpa_passphrase={self.passphrase}",
             "wpa_key_mgmt=WPA-PSK",
-            "ieee80211w=0",
             "wpa_pairwise=CCMP",
             "rsn_pairwise=CCMP",
+            # Disable management frame protection for compatibility
+            "ieee80211w=0",
+            # WPA key renewal settings - longer intervals to prevent disconnects
+            "wpa_group_rekey=3600",  # Rekey every hour instead of default 600s
+            "wpa_ptk_rekey=7200",    # PTK rekey every 2 hours
+            "wpa_gmk_rekey=86400",   # GMK rekey every 24 hours
+            # Station inactivity timeout (seconds) - be generous
+            "ap_max_inactivity=300",
+            # Logging (helps with debugging connection issues)
+            "logger_syslog=-1",
+            "logger_syslog_level=2",
+            "logger_stdout=-1",
+            "logger_stdout_level=2",
         ]
         # Enable 802.11ac for 5GHz where applicable
         if eff_hw_mode == 'a':
@@ -255,7 +272,10 @@ port=0
 dhcp-range={self.dhcp_start},{self.dhcp_end},12h
 dhcp-authoritative
 dhcp-option=3,{ap_ip_plain}
-dhcp-option=6,1.1.1.1,8.8.8.8
+dhcp-option=6,8.8.8.8,1.1.1.1
+dhcp-option=15,local
+log-dhcp
+leasefile-ro
 """.strip())
 
         # Make the config directory and files world-readable so a non-root
@@ -278,7 +298,7 @@ dhcp-option=6,1.1.1.1,8.8.8.8
         # message (missing driver support, configuration error, etc.).
         self._hostapd_proc = subprocess.Popen(["hostapd", str(hostapd_conf)],
                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.5)
+        time.sleep(1.5)  # Give hostapd more time to initialize interface
         # If hostapd exited quickly, capture stderr and raise an informative
         # error so callers (or an interactive user) can see why it failed.
         if self._hostapd_proc.poll() is not None:
@@ -308,10 +328,17 @@ dhcp-option=6,1.1.1.1,8.8.8.8
             else:
                 raise RuntimeError(f"hostapd failed to start: {msg}")
 
-        # Start dnsmasq after hostapd is running
+        # Hostapd started successfully - now configure IP address
+        print(f"Configuring IP {self.ap_ip} on {self.iface}")
+        self._run(["ip", "addr", "add", self.ap_ip, "dev", self.iface], check=False)
+        self._run(["ip", "link", "set", self.iface, "up"], check=False)
+        time.sleep(1.0)  # Give interface more time to settle before starting DHCP
+
+        # Start dnsmasq after hostapd is running and IP is configured
+        print(f"Starting DHCP server (dnsmasq) on {self.iface}")
         self._dnsmasq_proc = subprocess.Popen(["dnsmasq", "-C", str(dnsmasq_conf), "--no-daemon"],
                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.5)
+        time.sleep(1.0)  # Give dnsmasq time to bind to interface
         if self._dnsmasq_proc.poll() is not None:
             out = b""
             err = b""
@@ -334,6 +361,8 @@ dhcp-option=6,1.1.1.1,8.8.8.8
             if saved:
                 raise RuntimeError(f"dnsmasq failed to start: {msg}\nLogs written to: {saved}")
             raise RuntimeError(f"dnsmasq failed to start: {msg}")
+        
+        print(f"✓ DHCP server started successfully on {self.iface}")
 
     def _stop_services(self):
         for p in (self._hostapd_proc, self._dnsmasq_proc):
@@ -371,6 +400,11 @@ dhcp-option=6,1.1.1.1,8.8.8.8
         self._prepare_interface()
         hostapd_conf, dnsmasq_conf = self._write_configs()
         print("Wrote configs to:", hostapd_conf.parent)
+        print(f"AP Configuration:")
+        print(f"  SSID: {self.ssid}")
+        print(f"  Password: {'*' * len(self.passphrase)} ({len(self.passphrase)} chars)")
+        print(f"  Channel: {self.channel}")
+        print(f"  Interface: {self.iface}")
         self._start_services(hostapd_conf, dnsmasq_conf)
         # enable NAT if upstream provided
         if self.upstream_iface:
